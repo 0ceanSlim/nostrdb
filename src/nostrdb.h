@@ -601,6 +601,12 @@ int ndb_snapshot(struct ndb *ndb, const char *path, unsigned int flags);
 int ndb_add_key(struct ndb *ndb, unsigned char *key);
 
 int ndb_process_event(struct ndb *, const char *json, int len);
+
+// grain fork: enqueue a real delete of a note by its 32-byte id. The delete
+// is applied in FIFO order with ingests on the writer thread. Returns 1 on
+// successful enqueue, 0 if the writer inbox is full.
+int ndb_request_delete_note(struct ndb *ndb, const unsigned char *id);
+
 void ndb_ingest_meta_init(struct ndb_ingest_meta *meta, unsigned client, const char *relay);
 // Process an event, recording the relay where it came from.
 int ndb_process_event_with(struct ndb *, const char *json, int len, struct ndb_ingest_meta *meta);

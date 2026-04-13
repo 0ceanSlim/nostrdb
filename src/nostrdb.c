@@ -195,6 +195,7 @@ enum ndb_writer_msgtype {
 	NDB_WRITER_MIGRATE, // migrate the database
 	NDB_WRITER_NOTE_RELAY, // we already have the note, but we have more relays to write
 	NDB_WRITER_NOTE_META, // write note metadata to the db
+	NDB_WRITER_DELETE_NOTE, // grain fork: delete a note by id
 };
 
 // keys used for storing data in the NDB metadata database (NDB_DB_NDB_META)
@@ -2793,6 +2794,11 @@ struct ndb_writer_blocks {
 	uint64_t note_key;
 };
 
+// grain fork: delete a note by its 32-byte id
+struct ndb_writer_delete_note {
+	unsigned char id[32];
+};
+
 // The different types of messages that the writer thread can write to the
 // database
 struct ndb_writer_msg {
@@ -2805,6 +2811,7 @@ struct ndb_writer_msg {
 		struct ndb_writer_last_fetch last_fetch;
 		struct ndb_writer_blocks blocks;
 		struct ndb_writer_note_meta note_meta;
+		struct ndb_writer_delete_note delete_note;
 	};
 };
 
@@ -7153,6 +7160,222 @@ static int ndb_run_migrations(struct ndb_txn *txn)
 }
 
 
+// ============================================================================
+// grain fork: real delete support
+// ============================================================================
+//
+// ndb_delete_note_by_id physically removes an event from the database,
+// reversing the writes performed by ndb_write_note. It runs inside the writer
+// thread's write txn so it shares commit semantics with ingest — a batch that
+// contains both an ingest and a delete of the same id is ordered FIFO and
+// committed atomically.
+//
+// Sub-DBs covered (reverse of ndb_write_note fan-out):
+//   - NDB_DB_NOTE_PUBKEY_KIND   (direct mdb_del, dup-value)
+//   - NDB_DB_NOTE_PUBKEY        (direct mdb_del, dup-value)
+//   - NDB_DB_NOTE_TAGS          (iterate tags, recompute each key, mdb_del)
+//   - NDB_DB_NOTE_KIND          (direct mdb_del, dup-value)
+//   - NDB_DB_NOTE_RELAYS        (mdb_del with NULL val removes all dups)
+//   - NDB_DB_NOTE_ID            (direct mdb_del, dup-value)
+//   - NDB_DB_NOTE               (primary, direct mdb_del by note_key, last)
+//
+// Deliberately NOT covered in v0.5.0:
+//   - NDB_DB_NOTE_RELAY_KIND: variable-length composite key prefixed with
+//     note_key. Cursor-walk deletion is possible but requires care around
+//     ndb_relay_kind_cmp. Stale entries produce query results whose note_key
+//     points at a deleted primary — grain's query loop already skips these
+//     via the `result.note == nil` check, so correctness is preserved.
+//   - NDB_DB_NOTE_TEXT: per-word compressed keys. Reconstructing each key
+//     requires re-parsing the note content. Stale entries are filtered by
+//     the same nil-note skip.
+//   - NDB_DB_NOTE_BLOCKS: parsed block cache; stale entries are harmless.
+//   - Per-kind stats counters (reactions, reposts): cosmetic drift, not
+//     visible to clients via the relay protocol.
+//
+// The primary note row is deleted LAST. If the writer thread crashes
+// mid-batch, LMDB rolls the whole txn back atomically; partial delete state
+// is never visible on disk.
+//
+// The note body is read from NDB_DB_NOTE at the start and all field
+// references (pubkey, kind, created_at, tags) are snapshotted or used
+// before any mutation, so LMDB's within-txn data-stability guarantee
+// keeps the `struct ndb_note *` pointer valid until the primary delete.
+static int ndb_delete_note_by_id(struct ndb_txn *txn, const unsigned char *id)
+{
+	uint64_t note_key = 0;
+	size_t note_len = 0;
+	struct ndb_note *note;
+	uint64_t created_at;
+	uint64_t kind;
+	unsigned char pk_copy[32];
+	unsigned char id_copy[32];
+	MDB_val k, v;
+	int rc;
+
+	// 1. Locate the note and its primary key.
+	note = ndb_get_note_by_id(txn, id, &note_len, &note_key);
+	if (note == NULL || note_key == 0) {
+		ndb_debug("ndb_delete_note_by_id: note not found\n");
+		return 0;
+	}
+
+	// 2. Snapshot all fields we need so the deletes below don't depend on
+	//    the stability of the `note` pointer beyond the current txn.
+	created_at = ndb_note_created_at(note);
+	kind = ndb_note_kind(note);
+	memcpy(pk_copy, ndb_note_pubkey(note), 32);
+	memcpy(id_copy, id, 32);
+
+	// 3. Delete NDB_DB_NOTE_PUBKEY_KIND entry.
+	{
+		struct ndb_id_u64_ts pkk;
+		ndb_id_u64_ts_init(&pkk, pk_copy, kind, created_at);
+		k.mv_data = &pkk;
+		k.mv_size = sizeof(pkk);
+		v.mv_data = &note_key;
+		v.mv_size = sizeof(note_key);
+		rc = mdb_del(txn->mdb_txn,
+			     txn->lmdb->dbs[NDB_DB_NOTE_PUBKEY_KIND], &k, &v);
+		if (rc && rc != MDB_NOTFOUND) {
+			ndb_debug("ndb_delete_note_by_id: note_pubkey_kind del: %s\n",
+				  mdb_strerror(rc));
+		}
+	}
+
+	// 4. Delete NDB_DB_NOTE_PUBKEY entry.
+	{
+		struct ndb_tsid pk_tsid;
+		ndb_tsid_init(&pk_tsid, pk_copy, created_at);
+		k.mv_data = &pk_tsid;
+		k.mv_size = sizeof(pk_tsid);
+		v.mv_data = &note_key;
+		v.mv_size = sizeof(note_key);
+		rc = mdb_del(txn->mdb_txn,
+			     txn->lmdb->dbs[NDB_DB_NOTE_PUBKEY], &k, &v);
+		if (rc && rc != MDB_NOTFOUND) {
+			ndb_debug("ndb_delete_note_by_id: note_pubkey del: %s\n",
+				  mdb_strerror(rc));
+		}
+	}
+
+	// 5. Delete NDB_DB_NOTE_TAGS entries — one per single-char indexed
+	//    tag, keys reconstructed via the same ndb_encode_tag_key used by
+	//    the write side.
+	{
+		struct ndb_iterator iter;
+		unsigned char tag_key_buf[255];
+		int tag_key_len;
+		struct ndb_str tkey, tval;
+		char tchar;
+		int tval_len;
+
+		ndb_tags_iterate_start(note, &iter);
+		while (ndb_tags_iterate_next(&iter)) {
+			if (iter.tag->count < 2)
+				continue;
+			tkey = ndb_tag_str(note, iter.tag, 0);
+			tchar = tkey.str[0];
+			if (tchar == 0 || tkey.str[1] != 0)
+				continue;
+			tval = ndb_tag_str(note, iter.tag, 1);
+			tval_len = ndb_str_len(&tval);
+			tag_key_len = ndb_encode_tag_key(tag_key_buf,
+							 sizeof(tag_key_buf),
+							 tchar, tval.id,
+							 (unsigned char)tval_len,
+							 created_at);
+			if (!tag_key_len)
+				continue;
+			k.mv_data = tag_key_buf;
+			k.mv_size = tag_key_len;
+			v.mv_data = &note_key;
+			v.mv_size = sizeof(note_key);
+			rc = mdb_del(txn->mdb_txn,
+				     txn->lmdb->dbs[NDB_DB_NOTE_TAGS], &k, &v);
+			if (rc && rc != MDB_NOTFOUND) {
+				ndb_debug("ndb_delete_note_by_id: note_tags del '%c': %s\n",
+					  tchar, mdb_strerror(rc));
+			}
+		}
+	}
+
+	// 6. Delete NDB_DB_NOTE_KIND entry.
+	{
+		struct ndb_u64_ts kts;
+		ndb_u64_ts_init(&kts, kind, created_at);
+		k.mv_data = &kts;
+		k.mv_size = sizeof(kts);
+		v.mv_data = &note_key;
+		v.mv_size = sizeof(note_key);
+		rc = mdb_del(txn->mdb_txn,
+			     txn->lmdb->dbs[NDB_DB_NOTE_KIND], &k, &v);
+		if (rc && rc != MDB_NOTFOUND) {
+			ndb_debug("ndb_delete_note_by_id: note_kind del: %s\n",
+				  mdb_strerror(rc));
+		}
+	}
+
+	// 7. Delete all NDB_DB_NOTE_RELAYS dup values for this note_key.
+	//    Passing NULL as the value removes every duplicate under this key.
+	{
+		k.mv_data = &note_key;
+		k.mv_size = sizeof(note_key);
+		rc = mdb_del(txn->mdb_txn,
+			     txn->lmdb->dbs[NDB_DB_NOTE_RELAYS], &k, NULL);
+		if (rc && rc != MDB_NOTFOUND) {
+			ndb_debug("ndb_delete_note_by_id: note_relays del: %s\n",
+				  mdb_strerror(rc));
+		}
+	}
+
+	// 8. Delete NDB_DB_NOTE_ID entry.
+	{
+		struct ndb_tsid id_tsid;
+		ndb_tsid_init(&id_tsid, id_copy, created_at);
+		k.mv_data = &id_tsid;
+		k.mv_size = sizeof(id_tsid);
+		v.mv_data = &note_key;
+		v.mv_size = sizeof(note_key);
+		rc = mdb_del(txn->mdb_txn,
+			     txn->lmdb->dbs[NDB_DB_NOTE_ID], &k, &v);
+		if (rc && rc != MDB_NOTFOUND) {
+			ndb_debug("ndb_delete_note_by_id: note_id del: %s\n",
+				  mdb_strerror(rc));
+		}
+	}
+
+	// 9. Delete the primary NDB_DB_NOTE row. This invalidates the `note`
+	//    pointer — do nothing else with it after this point.
+	k.mv_data = &note_key;
+	k.mv_size = sizeof(note_key);
+	rc = mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE], &k, NULL);
+	if (rc) {
+		ndb_debug("ndb_delete_note_by_id: primary del failed: %s\n",
+			  mdb_strerror(rc));
+		return 0;
+	}
+
+	ndb_debug("ndb_delete_note_by_id: deleted note_key=%" PRIu64 "\n",
+		  note_key);
+	return 1;
+}
+
+// Public entrypoint: enqueue a delete on the writer thread. The delete is
+// applied in FIFO order with other writer messages and committed atomically
+// as part of the next writer-thread batch. Returns 1 on enqueue success, 0
+// if the queue is full.
+int ndb_request_delete_note(struct ndb *ndb, const unsigned char *id)
+{
+	struct ndb_writer_msg msg;
+	msg.type = NDB_WRITER_DELETE_NOTE;
+	memcpy(msg.delete_note.id, id, 32);
+	return ndb_writer_queue_msg(&ndb->writer.inbox, &msg);
+}
+
+// ============================================================================
+// end grain fork: real delete support
+// ============================================================================
+
 static void *ndb_writer_thread(void *data)
 {
 	ndb_debug("started writer thread\n");
@@ -7192,6 +7415,7 @@ static void *ndb_writer_thread(void *data)
 			case NDB_WRITER_BLOCKS:
 			case NDB_WRITER_MIGRATE:
 			case NDB_WRITER_NOTE_RELAY:
+			case NDB_WRITER_DELETE_NOTE:
 				needs_commit = 1;
 				break;
 			case NDB_WRITER_QUIT: break;
@@ -7284,6 +7508,10 @@ static void *ndb_writer_thread(void *data)
 						msg->last_fetch.pubkey,
 						msg->last_fetch.fetched_at
 						);
+				break;
+			case NDB_WRITER_DELETE_NOTE:
+				// grain fork: real delete support
+				ndb_delete_note_by_id(&txn, msg->delete_note.id);
 				break;
 			}
 		}
