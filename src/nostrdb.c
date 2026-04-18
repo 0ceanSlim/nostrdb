@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <limits.h>
 #include <assert.h>
+#include <time.h>
 
 #include "bindings/c/profile_json_parser.h"
 #include "bindings/c/profile_builder.h"
