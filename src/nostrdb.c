@@ -3369,11 +3369,20 @@ static int ndb_ingest_event(struct ndb_ingester *ingester, const char *json,
 
 	if (relay != NULL) {
 		relay = strdup(meta->relay);
-		if (relay == NULL)
+		if (relay == NULL) {
+			free(json_copy);
 			return 0;
+		}
 	}
 
-	return ndb_ingester_queue_event(ingester, json_copy, len, meta->client, relay);
+	if (!ndb_ingester_queue_event(ingester, json_copy, len, meta->client, relay)) {
+		free(json_copy);
+		if (relay != NULL)
+			free((char *)relay);
+		return 0;
+	}
+
+	return 1;
 }
 
 
@@ -3429,7 +3438,7 @@ static int ndb_ingester_process_note(secp256k1_context *secp,
 		msg.type = NDB_WRITER_PROFILE;
 		ndb_writer_note_init(&msg.profile.note, note, note_size, relay, 0);
 
-		prot_queue_push(ingester->writer_inbox, &msg);
+		prot_queue_push_blocking(ingester->writer_inbox, &msg);
 
 		return 1;
 	} else if (note->kind == 6) {
@@ -3454,7 +3463,7 @@ static int ndb_ingester_process_note(secp256k1_context *secp,
 	msg.type = NDB_WRITER_NOTE;
 	ndb_writer_note_init(&msg.note, note, note_size, relay, 0);
 
-	prot_queue_push(ingester->writer_inbox, &msg);
+	prot_queue_push_blocking(ingester->writer_inbox, &msg);
 
 	return 1;
 }
@@ -3515,7 +3524,7 @@ static int ndb_process_note_relay(struct ndb_txn *txn,
 	msg.note_relay.kind = ndb_note_kind(note);
 	msg.note_relay.created_at = ndb_note_created_at(note);
 
-	prot_queue_push(writer, &msg);
+	prot_queue_push_blocking(writer, &msg);
 
 	return 1;
 }

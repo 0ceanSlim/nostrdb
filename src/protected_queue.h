@@ -15,6 +15,9 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include "cursor.h"
 #include "util.h"
 #include "thread.h"
@@ -237,6 +240,32 @@ static inline void prot_queue_pop(struct prot_queue *q, void *data) {
 static inline void prot_queue_destroy(struct prot_queue* q) {
 	pthread_mutex_destroy(&q->mutex);
 	pthread_cond_destroy(&q->cond);
+}
+
+/*
+ * Cross-platform millisecond sleep used by prot_queue_push_blocking.
+ */
+static inline void ndb_msleep(int ms)
+{
+#ifdef _WIN32
+	Sleep(ms);
+#else
+	usleep(ms * 1000);
+#endif
+}
+
+/*
+ * Push an element onto the queue, blocking until space is available.
+ * Retries with a 1ms sleep when the queue is full. Use this from
+ * ingester threads pushing to the writer inbox where dropping events
+ * is unacceptable.
+ */
+static int prot_queue_push_blocking(struct prot_queue *q, void *data)
+{
+	while (!prot_queue_push(q, data)) {
+		ndb_msleep(1);
+	}
+	return 1;
 }
 
 #endif // PROT_QUEUE_H
