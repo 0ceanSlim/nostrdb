@@ -220,6 +220,32 @@ struct ndb_lmdb {
 	MDB_dbi dbs[NDB_DBS];
 };
 
+/**
+ * Clears stale LMDB reader slots after opening the environment.
+ *
+ * This protects startup on platforms where reader slots are not reclaimed
+ * automatically after process termination.
+ *
+ * @param[in] env The LMDB environment to inspect.
+ * @return 1 when the check succeeds, 0 when LMDB reports an error.
+ */
+static int ndb_lmdb_reader_check(MDB_env *env)
+{
+	int rc;
+	int dead = 0;
+
+	rc = mdb_reader_check(env, &dead);
+	if (rc != MDB_SUCCESS) {
+		fprintf(stderr, "mdb_reader_check failed: %s\n", mdb_strerror(rc));
+		return 0;
+	}
+
+	if (dead > 0)
+		fprintf(stderr, "mdb_reader_check cleared %d stale reader(s)\n", dead);
+
+	return 1;
+}
+
 struct ndb_writer {
 	struct ndb_lmdb *lmdb;
 	struct ndb_monitor *monitor;
@@ -4128,6 +4154,110 @@ static int ndb_write_reaction_stats(struct ndb_txn *txn, struct ndb_note *note,
 	       ndb_increment_total_reactions(txn, liked, scratch, scratch_size);
 }
 
+static struct ndb_str ndb_note_find_tag_str(struct ndb_note *note,
+					    const char *tag_name);
+
+// Parse bolt11 tag from a kind-9735 zap receipt and extract msats.
+// Returns 1 on success, 0 on failure. Sets *msats to 0 if amount unspecified.
+static int ndb_parse_zap_bolt11(struct ndb_note *note, uint64_t *msats)
+{
+	struct ndb_str bolt11_str;
+	struct bolt11 *inv;
+	char *fail;
+
+	bolt11_str = ndb_note_find_tag_str(note, "bolt11");
+	if (bolt11_str.str == NULL || bolt11_str.flag == NDB_PACKED_ID)
+		return 0;
+
+	inv = bolt11_decode_minimal(NULL, bolt11_str.str, &fail);
+	if (inv == NULL)
+		return 0;
+
+	*msats = (inv->msat != NULL) ? inv->msat->millisatoshis : 0;
+	tal_free(inv);
+	return 1;
+}
+
+// When receiving a kind-9735 zap receipt, parse the bolt11 tag and update
+// unverified zap counters on the zapped note's metadata
+static int ndb_write_unverified_zap_stats(struct ndb_txn *txn,
+					  struct ndb_note *note,
+					  unsigned char *scratch,
+					  size_t scratch_size)
+{
+	int rc;
+	uint32_t *count;
+	uint64_t *total;
+	uint64_t msats;
+	MDB_val key, val;
+	unsigned char *zapped_id;
+	struct ndb_note_meta *meta;
+	struct ndb_note_meta_entry *entry;
+	enum ndb_meta_clone_result cres;
+
+	zapped_id = ndb_note_last_id_tag(note, 'e');
+	if (zapped_id == NULL)
+		return 0;
+
+	if (!ndb_parse_zap_bolt11(note, &msats))
+		return 0;
+
+	meta = ndb_get_note_meta(txn, zapped_id);
+
+	cres = ndb_note_meta_clone_with_entry(&meta, &entry,
+		NDB_NOTE_META_ZAP_UNVERIFIED, NULL, scratch, scratch_size);
+
+	switch (cres) {
+	case NDB_META_CLONE_FAILED:
+		return 0;
+	case NDB_META_CLONE_NEW_ENTRY:
+		ndb_note_meta_zap_unverified_set(entry, 1, msats);
+		break;
+	case NDB_META_CLONE_EXISTING_ENTRY:
+		count = ndb_note_meta_zap_unverified_count(entry);
+		total = ndb_note_meta_zap_unverified_msats(entry);
+		(*count)++;
+		*total += msats;
+		break;
+	}
+
+	key.mv_data = zapped_id;
+	key.mv_size = 32;
+
+	val.mv_data = meta;
+	val.mv_size = ndb_note_meta_total_size(meta);
+	assert((val.mv_size % 8) == 0);
+
+	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_META], &key, &val, 0))) {
+		ndb_debug("write unverified zap stats to db failed: %s\n", mdb_strerror(rc));
+		return 0;
+	}
+
+	return 1;
+}
+
+// Find the first tag matching a multi-char name (e.g. "bolt11") and return
+// its value (element at index 1) as an ndb_str
+static struct ndb_str ndb_note_find_tag_str(struct ndb_note *note,
+					    const char *tag_name)
+{
+	struct ndb_iterator iter;
+	struct ndb_str str;
+	struct ndb_str empty = {0};
+
+	ndb_tags_iterate_start(note, &iter);
+
+	while (ndb_tags_iterate_next(&iter)) {
+		if (iter.tag->count < 2)
+			continue;
+
+		str = ndb_tag_str(note, iter.tag, 0);
+		if (str.flag != NDB_PACKED_ID && !strcmp(str.str, tag_name))
+			return ndb_tag_str(note, iter.tag, 1);
+	}
+
+	return empty;
+}
 
 static int ndb_write_note_id_index(struct ndb_txn *txn, struct ndb_note *note,
 				   uint64_t note_key)
@@ -6501,7 +6631,7 @@ static uint64_t ndb_write_note(secp256k1_context *secp,
 	/* this might be a reprocessed rumor, we need to update the giftwrap
 	 * UNWRAPPED flag if so
 	 */
-	if (ndb_note_is_rumor(note->note)) {
+	if (ndb_note_is_rumor(note->note) && writer_inbox) {
 		handle_reprocessed_giftwrap(txn, note->note, note->relay,
 					    writer_inbox);
 	}
@@ -6554,6 +6684,8 @@ static uint64_t ndb_write_note(secp256k1_context *secp,
 		ndb_write_reaction_stats(txn, note->note, scratch, scratch_size);
 	} else if (kind == 6 || kind == 16) {
 		ndb_process_repost_stats(txn, note->note, scratch, scratch_size);
+	} else if (kind == 9735 && !ndb_flag_set(ndb_flags, NDB_FLAG_NO_STATS)) {
+		ndb_write_unverified_zap_stats(txn, note->note, scratch, scratch_size);
 	}
 
 	return note_key;
@@ -7553,6 +7685,8 @@ static void *ndb_writer_thread(void *data)
 				ndb_blocks_free(msg->blocks.blocks);
 			} else if (msg->type == NDB_WRITER_NOTE_RELAY) {
 				free((void*)msg->note_relay.relay);
+			} else if (msg->type == NDB_WRITER_NOTE_META) {
+				free(msg->note_meta.metadata);
 			}
 		}
 	}
@@ -7989,6 +8123,12 @@ static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t map
 		return 0;
 	}
 
+	if (!ndb_lmdb_reader_check(lmdb->env)) {
+		mdb_env_close(lmdb->env);
+		lmdb->env = NULL;
+		return 0;
+	}
+
 	// Initialize DBs
 	if ((rc = mdb_txn_begin(lmdb->env, NULL, 0, &txn))) {
 		fprintf(stderr, "mdb_txn_begin failed, error %d\n", rc);
@@ -8214,6 +8354,187 @@ int ndb_snapshot(struct ndb *ndb, const char *path, unsigned int flags) {
 	return mdb_env_copy2(ndb->lmdb.env, path, flags);
 }
 
+static int ndb_compact_is_own_pubkey(const unsigned char *pubkey,
+				     const unsigned char (*own_pubkeys)[32],
+				     int num_pubkeys)
+{
+	for (int i = 0; i < num_pubkeys; i++) {
+		if (memcmp(pubkey, own_pubkeys[i], 32) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+int ndb_compact(struct ndb *ndb, const char *output_path,
+		const unsigned char (*own_pubkeys)[32], int num_pubkeys)
+{
+	int rc, ret;
+	struct ndb_lmdb dst_lmdb;
+	MDB_txn *src_mdb_txn, *dst_mdb_txn;
+	MDB_cursor *cur;
+	MDB_val k, v;
+	MDB_envinfo info;
+	struct ndb_txn src_txn, dst_txn;
+	secp256k1_context *secp;
+	size_t scratch_size;
+	unsigned char *scratch;
+	int count_profiles, count_notes;
+
+	ret = 0;
+	scratch_size = 2 * 1024 * 1024;
+	scratch = malloc(scratch_size);
+	if (!scratch) {
+		fprintf(stderr, "ndb_compact: failed to allocate scratch buffer\n");
+		return 0;
+	}
+
+	// get source mapsize
+	if ((rc = mdb_env_info(ndb->lmdb.env, &info))) {
+		fprintf(stderr, "ndb_compact: mdb_env_info failed: %s\n", mdb_strerror(rc));
+		free(scratch);
+		return 0;
+	}
+
+	// create destination lmdb environment
+	if (!ndb_init_lmdb(output_path, &dst_lmdb, info.me_mapsize)) {
+		fprintf(stderr, "ndb_compact: failed to init destination lmdb\n");
+		free(scratch);
+		return 0;
+	}
+
+	// open read txn on source
+	if ((rc = mdb_txn_begin(ndb->lmdb.env, NULL, MDB_RDONLY, &src_mdb_txn))) {
+		fprintf(stderr, "ndb_compact: src mdb_txn_begin failed: %s\n", mdb_strerror(rc));
+		goto cleanup_env;
+	}
+	src_txn.lmdb = &ndb->lmdb;
+	src_txn.mdb_txn = src_mdb_txn;
+
+	// open write txn on destination
+	if ((rc = mdb_txn_begin(dst_lmdb.env, NULL, 0, &dst_mdb_txn))) {
+		fprintf(stderr, "ndb_compact: dst mdb_txn_begin failed: %s\n", mdb_strerror(rc));
+		mdb_txn_abort(src_mdb_txn);
+		goto cleanup_env;
+	}
+	dst_txn.lmdb = &dst_lmdb;
+	dst_txn.mdb_txn = dst_mdb_txn;
+
+	secp = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
+
+	// Phase 1: Copy all profiles
+	count_profiles = 0;
+	if ((rc = mdb_cursor_open(src_mdb_txn, ndb->lmdb.dbs[NDB_DB_PROFILE], &cur))) {
+		fprintf(stderr, "ndb_compact: profile cursor open failed: %s\n", mdb_strerror(rc));
+		goto cleanup_txns;
+	}
+
+	while (mdb_cursor_get(cur, &k, &v, MDB_NEXT) == 0) {
+		NdbProfileRecord_table_t record;
+		uint64_t note_key;
+		struct ndb_note *note;
+		size_t note_len;
+		struct ndb_writer_profile profile;
+
+		record = NdbProfileRecord_as_root(v.mv_data);
+		note_key = NdbProfileRecord_note_key(record);
+		note = ndb_get_note_by_key(&src_txn, note_key, &note_len);
+
+		if (note == NULL)
+			continue;
+
+		// re-process profile from JSON content
+		if (!ndb_process_profile_note(note, &profile.record))
+			continue;
+
+		// note data is stable in source mmap for duration of read txn
+		ndb_writer_note_init(&profile.note, note, note_len, NULL, 0);
+
+		if (ndb_write_note_and_profile(secp, &dst_txn, &profile,
+					       scratch, scratch_size,
+					       NDB_FLAG_NO_STATS, NULL))
+		{
+			count_profiles++;
+		}
+
+		ndb_profile_record_builder_free(&profile.record);
+	}
+	mdb_cursor_close(cur);
+
+	fprintf(stderr, "ndb_compact: copied %d profiles\n", count_profiles);
+
+	// Phase 2: Copy own notes (skip kind 0, already handled above)
+	count_notes = 0;
+	if ((rc = mdb_cursor_open(src_mdb_txn, ndb->lmdb.dbs[NDB_DB_NOTE], &cur))) {
+		fprintf(stderr, "ndb_compact: note cursor open failed: %s\n", mdb_strerror(rc));
+		goto cleanup_txns;
+	}
+
+	while (mdb_cursor_get(cur, &k, &v, MDB_NEXT) == 0) {
+		struct ndb_note *note;
+		struct ndb_writer_note writer_note;
+
+		note = v.mv_data;
+
+		// skip kind 0 (profiles already handled)
+		if (ndb_note_kind(note) == 0)
+			continue;
+
+		// only keep notes from our own pubkeys
+		if (!ndb_compact_is_own_pubkey(ndb_note_pubkey(note),
+					       own_pubkeys, num_pubkeys))
+			continue;
+
+		// note data is stable in source mmap for duration of read txn
+		ndb_writer_note_init(&writer_note, note, v.mv_size, NULL, 0);
+
+		if (ndb_write_note(secp, &dst_txn, &writer_note,
+				   scratch, scratch_size,
+				   NDB_FLAG_NO_STATS, NULL))
+		{
+			count_notes++;
+		}
+	}
+	mdb_cursor_close(cur);
+
+	fprintf(stderr, "ndb_compact: copied %d own notes\n", count_notes);
+
+	// Phase 3: Copy profile_last_fetch entries
+	if ((rc = mdb_cursor_open(src_mdb_txn, ndb->lmdb.dbs[NDB_DB_PROFILE_LAST_FETCH], &cur))) {
+		fprintf(stderr, "ndb_compact: profile_last_fetch cursor open failed: %s\n", mdb_strerror(rc));
+		goto cleanup_txns;
+	}
+
+	while (mdb_cursor_get(cur, &k, &v, MDB_NEXT) == 0) {
+		mdb_put(dst_mdb_txn, dst_lmdb.dbs[NDB_DB_PROFILE_LAST_FETCH], &k, &v, 0);
+	}
+	mdb_cursor_close(cur);
+
+	// Write database version
+	ndb_write_version(&dst_txn, sizeof(MIGRATIONS) / sizeof(MIGRATIONS[0]));
+
+	// Commit destination
+	if ((rc = mdb_txn_commit(dst_mdb_txn))) {
+		fprintf(stderr, "ndb_compact: dst commit failed: %s\n", mdb_strerror(rc));
+		dst_mdb_txn = NULL;
+		goto cleanup_txns;
+	}
+	dst_mdb_txn = NULL;
+
+	ret = 1;
+
+cleanup_txns:
+	if (dst_mdb_txn)
+		mdb_txn_abort(dst_mdb_txn);
+	mdb_txn_abort(src_mdb_txn);
+	secp256k1_context_destroy(secp);
+
+cleanup_env:
+	mdb_env_close(dst_lmdb.env);
+	free(scratch);
+
+	return ret;
+}
+
 void ndb_destroy(struct ndb *ndb)
 {
 	if (ndb == NULL)
@@ -8277,6 +8598,119 @@ int ndb_process_event_with(struct ndb *ndb, const char *json, int json_len,
 			   struct ndb_ingest_meta *meta)
 {
 	return ndb_ingest_event(&ndb->ingester, json, json_len, meta);
+}
+
+int ndb_verify_zap(struct ndb *ndb, struct ndb_txn *txn,
+		   const unsigned char *zap_note_id)
+{
+	struct ndb_note *note;
+	struct ndb_note_meta *meta;
+	struct ndb_note_meta *zap_meta, *target_meta;
+	uint64_t *flags;
+	uint64_t msats;
+	unsigned char *zapped_id;
+	size_t meta_size;
+
+	note = ndb_get_note_by_id(txn, zap_note_id, NULL, NULL);
+	if (note == NULL)
+		return 0;
+
+	// check if already verified
+	meta = ndb_get_note_meta(txn, zap_note_id);
+	if (meta != NULL) {
+		flags = ndb_note_meta_flags(meta);
+		if (*flags & NDB_NOTE_META_FLAG_ZAP_VERIFIED)
+			return 1; // already verified, idempotent
+	}
+
+	if (!ndb_parse_zap_bolt11(note, &msats))
+		return 0;
+
+	// find zapped note (e tag)
+	zapped_id = ndb_note_last_id_tag(note, 'e');
+
+	// update zap stats on the zapped note if we have an e tag
+	if (zapped_id != NULL) {
+		unsigned char scratch[4096];
+		struct ndb_note_meta_entry *entry;
+		int rc;
+
+		target_meta = ndb_get_note_meta(txn, zapped_id);
+
+		// increment verified zap count
+		rc = ndb_note_meta_clone_with_entry(&target_meta, &entry,
+			NDB_NOTE_META_ZAP, NULL, scratch, sizeof(scratch));
+
+		switch (rc) {
+		case NDB_META_CLONE_FAILED:
+			break;
+		case NDB_META_CLONE_NEW_ENTRY:
+			ndb_note_meta_zap_set(entry, 1, msats);
+			break;
+		case NDB_META_CLONE_EXISTING_ENTRY: {
+			uint32_t *count = ndb_note_meta_zap_count(entry);
+			uint64_t *total = ndb_note_meta_zap_msats(entry);
+			(*count)++;
+			*total += msats;
+			break;
+		}
+		}
+
+		// decrement unverified zap count (move from unverified to verified)
+		if (rc != NDB_META_CLONE_FAILED) {
+			rc = ndb_note_meta_clone_with_entry(&target_meta, &entry,
+				NDB_NOTE_META_ZAP_UNVERIFIED, NULL,
+				scratch, sizeof(scratch));
+
+			if (rc == NDB_META_CLONE_EXISTING_ENTRY) {
+				uint32_t *count = ndb_note_meta_zap_unverified_count(entry);
+				uint64_t *total = ndb_note_meta_zap_unverified_msats(entry);
+				if (*count > 0)
+					(*count)--;
+				if (*total >= msats)
+					*total -= msats;
+				else
+					*total = 0;
+			}
+
+			meta_size = ndb_note_meta_total_size(target_meta);
+			struct ndb_note_meta *heap_meta = malloc(meta_size);
+			if (heap_meta) {
+				memcpy(heap_meta, target_meta, meta_size);
+				ndb_set_note_meta(ndb, zapped_id, heap_meta);
+			}
+		}
+	}
+
+	// mark the zap receipt as verified
+	{
+		unsigned char scratch2[4096];
+		struct ndb_note_meta *receipt_meta = meta;
+
+		if (receipt_meta == NULL) {
+			struct ndb_note_meta_builder builder;
+			ndb_note_meta_builder_init(&builder, scratch2, sizeof(scratch2));
+			ndb_note_meta_build(&builder, &receipt_meta);
+		} else {
+			meta_size = ndb_note_meta_total_size(receipt_meta);
+			if (meta_size > sizeof(scratch2))
+				return 0;
+			memcpy(scratch2, receipt_meta, meta_size);
+			receipt_meta = (struct ndb_note_meta *)scratch2;
+		}
+
+		flags = ndb_note_meta_flags(receipt_meta);
+		*flags |= NDB_NOTE_META_FLAG_ZAP_VERIFIED;
+
+		meta_size = ndb_note_meta_total_size(receipt_meta);
+		zap_meta = malloc(meta_size);
+		if (zap_meta == NULL)
+			return 0;
+		memcpy(zap_meta, receipt_meta, meta_size);
+		ndb_set_note_meta(ndb, zap_note_id, zap_meta);
+	}
+
+	return 1;
 }
 
 int _ndb_process_events(struct ndb *ndb, const char *ldjson, size_t json_len,

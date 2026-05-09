@@ -420,6 +420,40 @@ union ndb_reaction_str *ndb_note_meta_reaction_str(struct ndb_note_meta_entry *e
 	return &entry->payload.reaction_str;
 }
 
+uint32_t *ndb_note_meta_zap_count(struct ndb_note_meta_entry *entry)
+{
+	return &entry->aux.value;
+}
+
+uint64_t *ndb_note_meta_zap_msats(struct ndb_note_meta_entry *entry)
+{
+	return &entry->payload.value;
+}
+
+void ndb_note_meta_zap_set(struct ndb_note_meta_entry *entry, uint32_t count, uint64_t msats)
+{
+	entry->type = NDB_NOTE_META_ZAP;
+	entry->aux.value = count;
+	entry->payload.value = msats;
+}
+
+uint32_t *ndb_note_meta_zap_unverified_count(struct ndb_note_meta_entry *entry)
+{
+	return &entry->aux.value;
+}
+
+uint64_t *ndb_note_meta_zap_unverified_msats(struct ndb_note_meta_entry *entry)
+{
+	return &entry->payload.value;
+}
+
+void ndb_note_meta_zap_unverified_set(struct ndb_note_meta_entry *entry, uint32_t count, uint64_t msats)
+{
+	entry->type = NDB_NOTE_META_ZAP_UNVERIFIED;
+	entry->aux.value = count;
+	entry->payload.value = msats;
+}
+
 void print_note_meta(struct ndb_note_meta *meta)
 {
 	int count, i;
@@ -443,6 +477,16 @@ void print_note_meta(struct ndb_note_meta *meta)
 					*ndb_note_meta_counts_direct_replies(entry),
 					*ndb_note_meta_counts_thread_replies(entry),
 					*ndb_note_meta_counts_total_reactions(entry));
+			break;
+		case NDB_NOTE_META_ZAP:
+			printf("zaps %d\tmsats %llu\t",
+					*ndb_note_meta_zap_count(entry),
+					(unsigned long long)*ndb_note_meta_zap_msats(entry));
+			break;
+		case NDB_NOTE_META_ZAP_UNVERIFIED:
+			printf("unverified_zaps %d\tunverified_msats %llu\t",
+					*ndb_note_meta_zap_unverified_count(entry),
+					(unsigned long long)*ndb_note_meta_zap_unverified_msats(entry));
 			break;
 		}
 	}
