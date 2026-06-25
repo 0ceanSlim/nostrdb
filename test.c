@@ -50,6 +50,23 @@ static void db_load_events(struct ndb *ndb, const char *filename)
 	free(json);
 }
 
+// like db_load_events, but for relay-form ldjson (["EVENT","subid",{...}])
+static void db_load_relay_events(struct ndb *ndb, const char *filename)
+{
+	size_t filesize;
+	int written;
+	char *json;
+	struct stat st;
+
+	stat(filename, &st);
+	filesize = st.st_size;
+
+	json = malloc(filesize + 1);
+	read_file(filename, (unsigned char*)json, filesize, &written);
+	assert(ndb_process_events(ndb, json, written));
+	free(json);
+}
+
 static NdbProfile_table_t lookup_profile(struct ndb_txn *txn, uint64_t pk)
 {
 	void *root;
@@ -157,6 +174,280 @@ static void test_count_metadata()
 	delete_test_db();
 
 	printf("ok test_count_metadata\n");
+}
+
+#define PRUNE_TEST_DIR "./testdata/prune_db"
+
+// count notes matching `filter` in `ndb`
+static int prune_count_matching(struct ndb *ndb, struct ndb_filter *filter)
+{
+	struct ndb_txn txn;
+	struct ndb_query_result results[1024];
+	int count = 0;
+
+	ndb_begin_query(ndb, &txn);
+	assert(ndb_query(&txn, filter, 1, results, ARRAY_SIZE(results), &count));
+	ndb_end_query(&txn);
+
+	return count;
+}
+
+// count notes of a given kind currently in the db
+static int prune_count_kind(struct ndb *ndb, uint64_t kind)
+{
+	struct ndb_filter filter;
+	int count;
+
+	assert(ndb_filter_init(&filter));
+	assert(ndb_filter_start_field(&filter, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(&filter, kind));
+	ndb_filter_end_field(&filter);
+	assert(ndb_filter_end(&filter));
+
+	count = prune_count_matching(ndb, &filter);
+	ndb_filter_destroy(&filter);
+
+	return count;
+}
+
+// count notes authored by `pubkey` currently in the db
+static int prune_count_author(struct ndb *ndb, const unsigned char *pubkey)
+{
+	struct ndb_filter filter;
+	int count;
+
+	assert(ndb_filter_init(&filter));
+	assert(ndb_filter_start_field(&filter, NDB_FILTER_AUTHORS));
+	assert(ndb_filter_add_id_element(&filter, pubkey));
+	ndb_filter_end_field(&filter);
+	assert(ndb_filter_end(&filter));
+
+	count = prune_count_matching(ndb, &filter);
+	ndb_filter_destroy(&filter);
+
+	return count;
+}
+
+// grab the author of the first note of `kind` we find
+static void prune_first_author(struct ndb *ndb, uint64_t kind,
+			       unsigned char *pubkey_out)
+{
+	struct ndb_filter filter;
+	struct ndb_txn txn;
+	struct ndb_query_result results[1];
+	int count = 0;
+
+	assert(ndb_filter_init(&filter));
+	assert(ndb_filter_start_field(&filter, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(&filter, kind));
+	ndb_filter_end_field(&filter);
+	assert(ndb_filter_end(&filter));
+
+	ndb_begin_query(ndb, &txn);
+	assert(ndb_query(&txn, &filter, 1, results, ARRAY_SIZE(results), &count));
+	assert(count == 1);
+	memcpy(pubkey_out, ndb_note_pubkey(results[0].note), 32);
+	ndb_end_query(&txn);
+	ndb_filter_destroy(&filter);
+}
+
+// prune `src` into a fresh db with `filters`, then open and return it.
+// close it with prune_close
+static struct ndb *prune_into(struct ndb *src, struct ndb_config *cfg,
+			      struct ndb_filter *filters, int num_filters)
+{
+	struct ndb *pruned;
+
+	mkdir(PRUNE_TEST_DIR, 0755);
+	unlink(PRUNE_TEST_DIR "/data.mdb");
+	unlink(PRUNE_TEST_DIR "/lock.mdb");
+	assert(ndb_prune(src, PRUNE_TEST_DIR, filters, num_filters));
+	assert(ndb_init(&pruned, PRUNE_TEST_DIR, cfg));
+
+	return pruned;
+}
+
+static void prune_close(struct ndb *pruned)
+{
+	ndb_destroy(pruned);
+	unlink(PRUNE_TEST_DIR "/data.mdb");
+	unlink(PRUNE_TEST_DIR "/lock.mdb");
+}
+
+static uint64_t prune_last_fetch(struct ndb *ndb, const unsigned char *pubkey)
+{
+	struct ndb_txn txn;
+	uint64_t fetched_at;
+
+	ndb_begin_query(ndb, &txn);
+	fetched_at = ndb_read_last_profile_fetch(&txn, pubkey);
+	ndb_end_query(&txn);
+
+	return fetched_at;
+}
+
+// enough authors to outgrow a filter's default element capacity
+#define BIG_PUBKEYS 20000
+
+// total reaction count recorded on `id`'s metadata, 0 if it has none
+static uint32_t prune_total_reactions(struct ndb *ndb, const unsigned char *id)
+{
+	struct ndb_txn txn;
+	struct ndb_note_meta *meta;
+	struct ndb_note_meta_entry *entry;
+	uint32_t total = 0;
+
+	ndb_begin_query(ndb, &txn);
+	if ((meta = ndb_get_note_meta(&txn, id)) &&
+	    (entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_COUNTS, NULL)))
+	{
+		total = *ndb_note_meta_counts_total_reactions(entry);
+	}
+	ndb_end_query(&txn);
+
+	return total;
+}
+
+static void test_prune()
+{
+	struct ndb *ndb, *pruned;
+	struct ndb_config config;
+	struct ndb_filter filters[NDB_PRUNE_DEFAULT_FILTERS], kind7;
+	unsigned char author[32];
+	unsigned char stranger[32];
+	int kind0_before, kind1_before, kind7_before;
+	int author_notes, num_filters, i;
+	uint32_t reactions_before;
+	unsigned char *big_pubkeys;
+
+	// a note in test_counts.json that has reactions on it
+	const unsigned char reacted_id[] = {
+		0xd4, 0x4a, 0xd9, 0x6c, 0xb8, 0x92, 0x40, 0x92, 0xa7, 0x6b, 0xc2, 0xaf,
+		0xdd, 0xeb, 0x12, 0xeb, 0x85, 0x23, 0x3c, 0x0d, 0x03, 0xa7, 0xd9, 0xad,
+		0xc4, 0x2c, 0x2a, 0x85, 0xa7, 0x9a, 0x43, 0x05
+	};
+
+	memset(stranger, 0xfe, sizeof(stranger));
+
+	delete_test_db();
+	ndb_default_config(&config);
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	// profiles (kind 0) plus a mix of kind 1/6/7 notes
+	db_load_relay_events(ndb, "testdata/profiles.json");
+	db_load_events(ndb, "testdata/test_counts.json");
+
+	// a last-fetch row for a pubkey we have no profile for. it should not
+	// survive a prune, otherwise the client would never refetch it
+	assert(ndb_write_last_profile_fetch(ndb, stranger, 42));
+
+	// drain the writer queue so everything is committed before we prune
+	ndb_destroy(ndb);
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	kind0_before = prune_count_kind(ndb, 0);
+	kind1_before = prune_count_kind(ndb, 1);
+	kind7_before = prune_count_kind(ndb, 7);
+	assert(kind0_before > 0);
+	assert(kind1_before > 0);
+	assert(kind7_before > 0);
+
+	prune_first_author(ndb, 1, author);
+	author_notes = prune_count_author(ndb, author);
+	assert(author_notes > 0);
+	assert(author_notes < kind1_before);
+	assert(prune_last_fetch(ndb, stranger) == 42);
+
+	reactions_before = prune_total_reactions(ndb, reacted_id);
+	assert(reactions_before > 0);
+
+	// no filters is a plain copy: every note survives, kind 0 included
+	pruned = prune_into(ndb, &config, NULL, 0);
+	assert(prune_count_kind(pruned, 0) == kind0_before);
+	assert(prune_count_kind(pruned, 1) == kind1_before);
+	assert(prune_count_kind(pruned, 7) == kind7_before);
+	// the stranger has no profile, so its last-fetch row is dropped
+	assert(prune_last_fetch(pruned, stranger) == 0);
+	// kept reactions are re-counted, so the stats agree with the notes
+	assert(prune_total_reactions(pruned, reacted_id) == reactions_before);
+	prune_close(pruned);
+
+	// the default policy: all profiles, plus everything by our pubkeys
+	assert(ndb_prune_default_filters((const unsigned char (*)[32])author, 1,
+					 filters, ARRAY_SIZE(filters),
+					 &num_filters));
+	assert(num_filters == 2);
+
+	pruned = prune_into(ndb, &config, filters, num_filters);
+	assert(prune_count_kind(pruned, 0) == kind0_before);
+	assert(prune_count_author(pruned, author) == author_notes);
+	// notes matching neither filter are gone
+	assert(prune_count_kind(pruned, 1) < kind1_before);
+	assert(prune_count_kind(pruned, 7) == 0);
+	// our author kept its profile, so its last-fetch row would survive too
+	assert(prune_last_fetch(pruned, author) ==
+	       prune_last_fetch(ndb, author));
+	prune_close(pruned);
+
+	for (num_filters--; num_filters >= 0; num_filters--)
+		ndb_filter_destroy(&filters[num_filters]);
+
+	// with no pubkeys to keep we only emit the profiles filter, since an
+	// empty authors set would match nothing
+	assert(ndb_prune_default_filters(NULL, 0, filters, ARRAY_SIZE(filters),
+					 &num_filters));
+	assert(num_filters == 1);
+
+	pruned = prune_into(ndb, &config, filters, num_filters);
+	assert(prune_count_kind(pruned, 0) == kind0_before);
+	assert(prune_count_kind(pruned, 1) == 0);
+	assert(prune_count_kind(pruned, 7) == 0);
+	prune_close(pruned);
+
+	ndb_filter_destroy(&filters[0]);
+
+	// a policy that keeps no profiles drops their last-fetch rows as well
+	assert(ndb_filter_init(&kind7));
+	assert(ndb_filter_start_field(&kind7, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(&kind7, 7));
+	ndb_filter_end_field(&kind7);
+	assert(ndb_filter_end(&kind7));
+
+	pruned = prune_into(ndb, &config, &kind7, 1);
+	assert(prune_count_kind(pruned, 7) == kind7_before);
+	assert(prune_count_kind(pruned, 0) == 0);
+	assert(prune_count_kind(pruned, 1) == 0);
+	assert(prune_last_fetch(pruned, author) == 0);
+	prune_close(pruned);
+
+	ndb_filter_destroy(&kind7);
+
+	// an author set far larger than a filter's default capacity: the
+	// policy builder has to size the filter to fit it
+	big_pubkeys = malloc(BIG_PUBKEYS * 32);
+	assert(big_pubkeys);
+	for (i = 0; i < BIG_PUBKEYS; i++)
+		memset(big_pubkeys + i * 32, i & 0xff, 32);
+	memcpy(big_pubkeys + (BIG_PUBKEYS - 1) * 32, author, 32);
+
+	assert(ndb_prune_default_filters(
+			(const unsigned char (*)[32])big_pubkeys, BIG_PUBKEYS,
+			filters, ARRAY_SIZE(filters), &num_filters));
+	assert(num_filters == 2);
+
+	pruned = prune_into(ndb, &config, filters, num_filters);
+	assert(prune_count_author(pruned, author) == author_notes);
+	assert(prune_count_kind(pruned, 7) == 0);
+	prune_close(pruned);
+
+	ndb_filter_destroy(&filters[0]);
+	ndb_filter_destroy(&filters[1]);
+	free(big_pubkeys);
+
+	ndb_destroy(ndb);
+	delete_test_db();
+
+	printf("ok test_prune\n");
 }
 
 static void test_nip44_test_vector()
@@ -3689,6 +3980,7 @@ int main(int argc, const char *argv[]) {
 	test_custom_filter();
 	test_metadata();
 	test_count_metadata();
+	test_prune();
 	test_reaction_encoding();
 	test_reaction_counter();
 	test_note_relay_index();
