@@ -2655,6 +2655,22 @@ static int ndb_migrate_lower_user_search_indices(struct ndb_txn *txn)
 	return ndb_migrate_user_search_indices(txn);
 }
 
+static int ndb_migrate_search_key_cmp_fix(struct ndb_txn *txn)
+{
+	// ndb_search_key_cmp used to leave its right-hand MDB_val at the full
+	// struct size while narrowing the left to search+id, so mdb_cmp_memn
+	// broke every equal-prefix tie on length and returned -1. Equal keys
+	// never compared equal, so each rewrite of a profile appended another
+	// entry instead of replacing one. Drop and rebuild so existing dbs
+	// shed those duplicates and get sorted by the corrected comparator.
+	if (mdb_drop(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_PROFILE_SEARCH], 0)) {
+		fprintf(stderr, "ndb_migrate_search_key_cmp_fix: mdb_drop failed\n");
+		return 0;
+	}
+
+	return ndb_migrate_user_search_indices(txn);
+}
+
 int ndb_process_profile_note(struct ndb_note *note, struct ndb_profile_record_builder *profile);
 
 
@@ -2961,6 +2977,7 @@ static struct ndb_migration MIGRATIONS[] = {
 	{ .fn = ndb_migrate_utf8_profile_names },
 	{ .fn = ndb_migrate_profile_indices },
 	{ .fn = ndb_migrate_metadata },
+	{ .fn = ndb_migrate_search_key_cmp_fix },
 };
 
 
@@ -3899,8 +3916,15 @@ static int ndb_search_key_cmp(const MDB_val *a, const MDB_val *b)
 	MDB_val a2 = *a;
 	MDB_val b2 = *b;
 
+	// compare search+id on both sides. if we left b2 at the full struct
+	// size, mdb_cmp_memn would break the tie on length and always return
+	// -1 for equal prefixes, making the timestamp compare below dead code
+	// and the comparator non-antisymmetric.
 	a2.mv_data = ska->search;
 	a2.mv_size = sizeof(ska->search) + sizeof(ska->id);
+
+	b2.mv_data = skb->search;
+	b2.mv_size = sizeof(skb->search) + sizeof(skb->id);
 
 	cmp = mdb_cmp_memn(&a2, &b2);
 	if (cmp) return cmp;
