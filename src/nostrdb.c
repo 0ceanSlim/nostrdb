@@ -3445,6 +3445,14 @@ int ndb_process_profile_note(struct ndb_note *note,
 	return 1;
 }
 
+// free the json and relay copies that ndb_ingest_event handed to the queue
+static void ndb_ingester_free_event_data(char *json, const char *relay)
+{
+	free(json);
+	if (relay)
+		free((void *)relay);
+}
+
 static int ndb_ingester_queue_event(struct ndb_ingester *ingester,
 				    char *json, unsigned len,
 				    unsigned client, const char *relay)
@@ -3511,11 +3519,23 @@ static int ndb_ingest_event(struct ndb_ingester *ingester, const char *json,
 
 	if (relay != NULL) {
 		relay = strdup(meta->relay);
-		if (relay == NULL)
+		if (relay == NULL) {
+			free(json_copy);
 			return 0;
+		}
 	}
 
-	return ndb_ingester_queue_event(ingester, json_copy, len, meta->client, relay);
+	// the ingester thread owns these once queued, so they are still ours
+	// if the handoff fails. prot_queue_push is non-blocking and returns 0
+	// when the inbox is full, so this is reachable under load
+	if (!ndb_ingester_queue_event(ingester, json_copy, len, meta->client,
+				      relay))
+	{
+		ndb_ingester_free_event_data(json_copy, relay);
+		return 0;
+	}
+
+	return 1;
 }
 
 
@@ -8291,7 +8311,7 @@ static void *ndb_ingester_thread(void *data)
 	struct ndb_ingester *ingester = (struct ndb_ingester *)thread->ctx;
 	struct ndb_lmdb *lmdb = ingester->lmdb;
 	struct ndb_ingester_msg msgs[THREAD_QUEUE_BATCH], *msg;
-	int i, popped, done, any_event, rc, nkeys, npns_keys, nsns_keys;
+	int i, popped, done, quitting, any_event, rc, nkeys, npns_keys, nsns_keys;
 	MDB_txn *read_txn = NULL;
 	struct keypair *keys;
 	struct pns_key *pns_keys;
@@ -8314,6 +8334,7 @@ static void *ndb_ingester_thread(void *data)
 	//ndb_debug("started ingester thread\n");
 
 	done = 0;
+	quitting = 0;
 	while (!done) {
 		any_event = 0;
 
@@ -8353,9 +8374,20 @@ static void *ndb_ingester_thread(void *data)
 
 		if (any_event && (rc = mdb_txn_begin(lmdb->env, NULL,
 						     MDB_RDONLY, &read_txn))) {
-			// this is bad
+			// this is bad. we drop the whole batch, so free what we
+			// would have consumed, and honor a quit inside it or we
+			// would wait on an empty inbox forever and the join in
+			// threadpool_destroy would never return
 			fprintf(stderr, "UNUSUAL ndb_ingester: mdb_txn_begin failed: '%s'\n",
 					mdb_strerror(rc));
+			for (i = 0; i < popped; i++) {
+				msg = &msgs[i];
+				if (msg->type == NDB_INGEST_EVENT)
+					ndb_ingester_free_event_data(msg->event.json,
+								     msg->event.relay);
+				else if (msg->type == NDB_INGEST_QUIT)
+					quitting = 1;
+			}
 			continue;
 		}
 
@@ -8363,7 +8395,7 @@ static void *ndb_ingester_thread(void *data)
 			msg = &msgs[i];
 			switch (msg->type) {
 			case NDB_INGEST_QUIT:
-				done = 1;
+				quitting = 1;
 				break;
 
 			case NDB_INGEST_PROCESS_GIFTWRAP:
@@ -8422,6 +8454,13 @@ static void *ndb_ingester_thread(void *data)
 
 		if (any_event)
 			mdb_txn_abort(read_txn);
+
+		// processing an event can queue more work on us: a kind-6
+		// repost re-ingests the note in its content. so a quit only
+		// takes effect once the inbox is actually empty, otherwise we
+		// strand those events in a queue that is about to be freed
+		if (quitting && prot_queue_empty(&thread->inbox))
+			done = 1;
 	}
 
 	ndb_debug("quitting ingester thread\n");
