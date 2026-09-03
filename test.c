@@ -1668,6 +1668,8 @@ static void test_timeline_query()
 	ndb_filter_destroy(&filter);
 
 	assert(count == 10);
+
+	ndb_destroy(ndb);
 }
 
 // Test fetched_at profile records. These are saved when new profiles are
@@ -2160,6 +2162,7 @@ static void test_replacement()
 	assert(!strcmp(name, "jb55"));
 
 	ndb_end_query(&txn);
+	ndb_destroy(ndb);
 
 	free(json);
 	free(buf);
@@ -3633,6 +3636,7 @@ static void test_filter_is_subset() {
 	assert(ndb_filter_is_subset_of(ki, k) == 1);
 	assert(ndb_filter_is_subset_of(k, ki) == 0);
 
+	ndb_filter_destroy(g);
 	ndb_filter_destroy(k);
 	ndb_filter_destroy(ki);
 }
