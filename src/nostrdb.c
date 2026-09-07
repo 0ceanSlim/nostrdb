@@ -294,6 +294,12 @@ struct ndb_monitor {
 	pthread_cond_t cond;
 };
 
+// Total writer failures (map full, bad txn, etc.). nostrdb's writer thread only
+// logs these to stderr; grain polls this via ndb_write_error_count() to surface
+// otherwise-invisible write failures. Written by the single writer thread, read
+// cross-thread from Go, so accessed via atomics.
+static uint64_t ndb_write_errors_total = 0;
+
 struct ndb {
 	struct ndb_lmdb lmdb;
 	struct ndb_ingester ingester;
@@ -1934,6 +1940,7 @@ static int ndb_write_note_relay_kind_index(
 	v.mv_size = 0;
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_RELAY_KIND], &k, &v, 0))) {
+		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
 		fprintf(stderr, "write note relay kind index failed: %s\n",
 			  mdb_strerror(rc));
 		return 0;
@@ -1966,6 +1973,7 @@ static int ndb_write_note_pubkey_index(struct ndb_txn *txn, struct ndb_note *not
 	v.mv_size = sizeof(note_key);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_PUBKEY], &k, &v, 0))) {
+		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
 		fprintf(stderr, "write note pubkey index failed: %s\n",
 			  mdb_strerror(rc));
 		return 0;
@@ -1992,6 +2000,7 @@ static int ndb_write_note_pubkey_kind_index(struct ndb_txn *txn,
 	v.mv_size = sizeof(note_key);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_PUBKEY_KIND], &k, &v, 0))) {
+		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
 		fprintf(stderr, "write note pubkey_kind index failed: %s\n",
 			  mdb_strerror(rc));
 		return 0;
@@ -6654,6 +6663,7 @@ static uint64_t ndb_write_note(secp256k1_context *secp,
 	val.mv_size = note->note_len;
 
 	if ((rc = mdb_put(txn->mdb_txn, note_db, &key, &val, 0))) {
+		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
 		ndb_debug("write note to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -8098,6 +8108,37 @@ static int ndb_ingester_destroy(struct ndb_ingester *ingester)
 	return 1;
 }
 
+// ndb_map_usage reports LMDB map usage so grain can surface a usage gauge and
+// reject writes before the map fills — a full map makes the writer thread fail
+// silently (MDB_MAP_FULL) while events are still acked. used_bytes is the last
+// used page's extent; map_bytes is the configured ceiling. Returns 1 on success.
+int ndb_map_usage(struct ndb *ndb, size_t *used_bytes, size_t *map_bytes)
+{
+	MDB_envinfo info;
+	MDB_stat st;
+
+	if (ndb == NULL || ndb->lmdb.env == NULL)
+		return 0;
+	if (mdb_env_info(ndb->lmdb.env, &info))
+		return 0;
+	if (mdb_env_stat(ndb->lmdb.env, &st))
+		return 0;
+
+	if (used_bytes)
+		*used_bytes = (size_t)(info.me_last_pgno + 1) * (size_t)st.ms_psize;
+	if (map_bytes)
+		*map_bytes = info.me_mapsize;
+	return 1;
+}
+
+// ndb_write_error_count returns the running total of writer failures (map full,
+// bad txn, etc.). grain polls it to detect silent write loss — the writer only
+// logs to stderr, and events are acked OK before the write actually commits.
+uint64_t ndb_write_error_count(void)
+{
+	return __atomic_load_n(&ndb_write_errors_total, __ATOMIC_RELAXED);
+}
+
 static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t mapsize)
 {
 	int rc;
@@ -8118,7 +8159,19 @@ static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t map
 		return 0;
 	}
 
-	if ((rc = mdb_env_open(lmdb->env, filename, 0, 0664))) {
+	// Raise the reader-slot cap above LMDB's default 126: a busy relay can hold
+	// many concurrent REQ read transactions at once.
+	if ((rc = mdb_env_set_maxreaders(lmdb->env, 512))) {
+		fprintf(stderr, "mdb_env_set_maxreaders failed, error %d\n", rc);
+		return 0;
+	}
+
+	// MDB_NOTLS binds a read txn's reader slot to the transaction, not the OS
+	// thread. grain's Go callers run BeginQuery..EndQuery within a single
+	// goroutine that can migrate OS threads across cgo calls; without NOTLS the
+	// thread-bound slot breaks (MDB_BAD_RSLOT) after a migration, which surfaced
+	// as intermittent "ndb_begin_query failed" / "could not query events".
+	if ((rc = mdb_env_open(lmdb->env, filename, MDB_NOTLS, 0664))) {
 		fprintf(stderr, "mdb_env_open failed, error %d\n", rc);
 		return 0;
 	}
