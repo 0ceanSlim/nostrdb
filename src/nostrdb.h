@@ -754,6 +754,9 @@ void ndb_stat_counts_init(struct ndb_stat_counts *counts);
 // Reports LMDB map usage (bytes used vs the map ceiling) for a usage gauge and
 // pre-full write rejection. Returns 1 on success.
 int ndb_map_usage(struct ndb *ndb, size_t *used_bytes, size_t *map_bytes);
+// Running total of writer failures (map full / bad txn / etc.); the writer only
+// logs to stderr, so grain polls this to surface silent write loss.
+uint64_t ndb_write_error_count(void);
 
 // NOTE
 const char *ndb_note_content(struct ndb_note *note);

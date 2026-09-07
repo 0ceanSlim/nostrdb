@@ -268,6 +268,12 @@ struct ndb_monitor {
 	pthread_cond_t cond;
 };
 
+// Total writer failures (map full, bad txn, etc.). nostrdb's writer thread only
+// logs these to stderr; grain polls this via ndb_write_error_count() to surface
+// otherwise-invisible write failures. Written by the single writer thread, read
+// cross-thread from Go, so accessed via atomics.
+static uint64_t ndb_write_errors_total = 0;
+
 struct ndb {
 	struct ndb_lmdb lmdb;
 	struct ndb_ingester ingester;
@@ -1908,6 +1914,7 @@ static int ndb_write_note_relay_kind_index(
 	v.mv_size = 0;
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_RELAY_KIND], &k, &v, 0))) {
+		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
 		fprintf(stderr, "write note relay kind index failed: %s\n",
 			  mdb_strerror(rc));
 		return 0;
@@ -1940,6 +1947,7 @@ static int ndb_write_note_pubkey_index(struct ndb_txn *txn, struct ndb_note *not
 	v.mv_size = sizeof(note_key);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_PUBKEY], &k, &v, 0))) {
+		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
 		fprintf(stderr, "write note pubkey index failed: %s\n",
 			  mdb_strerror(rc));
 		return 0;
@@ -1966,6 +1974,7 @@ static int ndb_write_note_pubkey_kind_index(struct ndb_txn *txn,
 	v.mv_size = sizeof(note_key);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_PUBKEY_KIND], &k, &v, 0))) {
+		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
 		fprintf(stderr, "write note pubkey_kind index failed: %s\n",
 			  mdb_strerror(rc));
 		return 0;
@@ -6524,6 +6533,7 @@ static uint64_t ndb_write_note(secp256k1_context *secp,
 	val.mv_size = note->note_len;
 
 	if ((rc = mdb_put(txn->mdb_txn, note_db, &key, &val, 0))) {
+		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
 		ndb_debug("write note to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -7985,6 +7995,14 @@ int ndb_map_usage(struct ndb *ndb, size_t *used_bytes, size_t *map_bytes)
 	if (map_bytes)
 		*map_bytes = info.me_mapsize;
 	return 1;
+}
+
+// ndb_write_error_count returns the running total of writer failures (map full,
+// bad txn, etc.). grain polls it to detect silent write loss — the writer only
+// logs to stderr, and events are acked OK before the write actually commits.
+uint64_t ndb_write_error_count(void)
+{
+	return __atomic_load_n(&ndb_write_errors_total, __ATOMIC_RELAXED);
 }
 
 static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t mapsize)
