@@ -7964,6 +7964,29 @@ static int ndb_ingester_destroy(struct ndb_ingester *ingester)
 	return 1;
 }
 
+// ndb_map_usage reports LMDB map usage so grain can surface a usage gauge and
+// reject writes before the map fills — a full map makes the writer thread fail
+// silently (MDB_MAP_FULL) while events are still acked. used_bytes is the last
+// used page's extent; map_bytes is the configured ceiling. Returns 1 on success.
+int ndb_map_usage(struct ndb *ndb, size_t *used_bytes, size_t *map_bytes)
+{
+	MDB_envinfo info;
+	MDB_stat st;
+
+	if (ndb == NULL || ndb->lmdb.env == NULL)
+		return 0;
+	if (mdb_env_info(ndb->lmdb.env, &info))
+		return 0;
+	if (mdb_env_stat(ndb->lmdb.env, &st))
+		return 0;
+
+	if (used_bytes)
+		*used_bytes = (size_t)(info.me_last_pgno + 1) * (size_t)st.ms_psize;
+	if (map_bytes)
+		*map_bytes = info.me_mapsize;
+	return 1;
+}
+
 static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t mapsize)
 {
 	int rc;
@@ -7984,7 +8007,19 @@ static int ndb_init_lmdb(const char *filename, struct ndb_lmdb *lmdb, size_t map
 		return 0;
 	}
 
-	if ((rc = mdb_env_open(lmdb->env, filename, 0, 0664))) {
+	// Raise the reader-slot cap above LMDB's default 126: a busy relay can hold
+	// many concurrent REQ read transactions at once.
+	if ((rc = mdb_env_set_maxreaders(lmdb->env, 512))) {
+		fprintf(stderr, "mdb_env_set_maxreaders failed, error %d\n", rc);
+		return 0;
+	}
+
+	// MDB_NOTLS binds a read txn's reader slot to the transaction, not the OS
+	// thread. grain's Go callers run BeginQuery..EndQuery within a single
+	// goroutine that can migrate OS threads across cgo calls; without NOTLS the
+	// thread-bound slot breaks (MDB_BAD_RSLOT) after a migration, which surfaced
+	// as intermittent "ndb_begin_query failed" / "could not query events".
+	if ((rc = mdb_env_open(lmdb->env, filename, MDB_NOTLS, 0664))) {
 		fprintf(stderr, "mdb_env_open failed, error %d\n", rc);
 		return 0;
 	}

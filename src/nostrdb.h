@@ -751,6 +751,9 @@ const char *ndb_reaction_to_str(union ndb_reaction_str *str, char buf[128]);
 // STATS
 int ndb_stat(struct ndb *ndb, struct ndb_stat *stat);
 void ndb_stat_counts_init(struct ndb_stat_counts *counts);
+// Reports LMDB map usage (bytes used vs the map ceiling) for a usage gauge and
+// pre-full write rejection. Returns 1 on success.
+int ndb_map_usage(struct ndb *ndb, size_t *used_bytes, size_t *map_bytes);
 
 // NOTE
 const char *ndb_note_content(struct ndb_note *note);
