@@ -50,6 +50,23 @@ static void db_load_events(struct ndb *ndb, const char *filename)
 	free(json);
 }
 
+// like db_load_events, but for relay-form ldjson (["EVENT","subid",{...}])
+static void db_load_relay_events(struct ndb *ndb, const char *filename)
+{
+	size_t filesize;
+	int written;
+	char *json;
+	struct stat st;
+
+	stat(filename, &st);
+	filesize = st.st_size;
+
+	json = malloc(filesize + 1);
+	read_file(filename, (unsigned char*)json, filesize, &written);
+	assert(ndb_process_events(ndb, json, written));
+	free(json);
+}
+
 static NdbProfile_table_t lookup_profile(struct ndb_txn *txn, uint64_t pk)
 {
 	void *root;
@@ -157,6 +174,280 @@ static void test_count_metadata()
 	delete_test_db();
 
 	printf("ok test_count_metadata\n");
+}
+
+#define PRUNE_TEST_DIR "./testdata/prune_db"
+
+// count notes matching `filter` in `ndb`
+static int prune_count_matching(struct ndb *ndb, struct ndb_filter *filter)
+{
+	struct ndb_txn txn;
+	struct ndb_query_result results[1024];
+	int count = 0;
+
+	ndb_begin_query(ndb, &txn);
+	assert(ndb_query(&txn, filter, 1, results, ARRAY_SIZE(results), &count));
+	ndb_end_query(&txn);
+
+	return count;
+}
+
+// count notes of a given kind currently in the db
+static int prune_count_kind(struct ndb *ndb, uint64_t kind)
+{
+	struct ndb_filter filter;
+	int count;
+
+	assert(ndb_filter_init(&filter));
+	assert(ndb_filter_start_field(&filter, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(&filter, kind));
+	ndb_filter_end_field(&filter);
+	assert(ndb_filter_end(&filter));
+
+	count = prune_count_matching(ndb, &filter);
+	ndb_filter_destroy(&filter);
+
+	return count;
+}
+
+// count notes authored by `pubkey` currently in the db
+static int prune_count_author(struct ndb *ndb, const unsigned char *pubkey)
+{
+	struct ndb_filter filter;
+	int count;
+
+	assert(ndb_filter_init(&filter));
+	assert(ndb_filter_start_field(&filter, NDB_FILTER_AUTHORS));
+	assert(ndb_filter_add_id_element(&filter, pubkey));
+	ndb_filter_end_field(&filter);
+	assert(ndb_filter_end(&filter));
+
+	count = prune_count_matching(ndb, &filter);
+	ndb_filter_destroy(&filter);
+
+	return count;
+}
+
+// grab the author of the first note of `kind` we find
+static void prune_first_author(struct ndb *ndb, uint64_t kind,
+			       unsigned char *pubkey_out)
+{
+	struct ndb_filter filter;
+	struct ndb_txn txn;
+	struct ndb_query_result results[1];
+	int count = 0;
+
+	assert(ndb_filter_init(&filter));
+	assert(ndb_filter_start_field(&filter, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(&filter, kind));
+	ndb_filter_end_field(&filter);
+	assert(ndb_filter_end(&filter));
+
+	ndb_begin_query(ndb, &txn);
+	assert(ndb_query(&txn, &filter, 1, results, ARRAY_SIZE(results), &count));
+	assert(count == 1);
+	memcpy(pubkey_out, ndb_note_pubkey(results[0].note), 32);
+	ndb_end_query(&txn);
+	ndb_filter_destroy(&filter);
+}
+
+// prune `src` into a fresh db with `filters`, then open and return it.
+// close it with prune_close
+static struct ndb *prune_into(struct ndb *src, struct ndb_config *cfg,
+			      struct ndb_filter *filters, int num_filters)
+{
+	struct ndb *pruned;
+
+	mkdir(PRUNE_TEST_DIR, 0755);
+	unlink(PRUNE_TEST_DIR "/data.mdb");
+	unlink(PRUNE_TEST_DIR "/lock.mdb");
+	assert(ndb_prune(src, PRUNE_TEST_DIR, filters, num_filters));
+	assert(ndb_init(&pruned, PRUNE_TEST_DIR, cfg));
+
+	return pruned;
+}
+
+static void prune_close(struct ndb *pruned)
+{
+	ndb_destroy(pruned);
+	unlink(PRUNE_TEST_DIR "/data.mdb");
+	unlink(PRUNE_TEST_DIR "/lock.mdb");
+}
+
+static uint64_t prune_last_fetch(struct ndb *ndb, const unsigned char *pubkey)
+{
+	struct ndb_txn txn;
+	uint64_t fetched_at;
+
+	ndb_begin_query(ndb, &txn);
+	fetched_at = ndb_read_last_profile_fetch(&txn, pubkey);
+	ndb_end_query(&txn);
+
+	return fetched_at;
+}
+
+// enough authors to outgrow a filter's default element capacity
+#define BIG_PUBKEYS 20000
+
+// total reaction count recorded on `id`'s metadata, 0 if it has none
+static uint32_t prune_total_reactions(struct ndb *ndb, const unsigned char *id)
+{
+	struct ndb_txn txn;
+	struct ndb_note_meta *meta;
+	struct ndb_note_meta_entry *entry;
+	uint32_t total = 0;
+
+	ndb_begin_query(ndb, &txn);
+	if ((meta = ndb_get_note_meta(&txn, id)) &&
+	    (entry = ndb_note_meta_find_entry(meta, NDB_NOTE_META_COUNTS, NULL)))
+	{
+		total = *ndb_note_meta_counts_total_reactions(entry);
+	}
+	ndb_end_query(&txn);
+
+	return total;
+}
+
+static void test_prune()
+{
+	struct ndb *ndb, *pruned;
+	struct ndb_config config;
+	struct ndb_filter filters[NDB_PRUNE_DEFAULT_FILTERS], kind7;
+	unsigned char author[32];
+	unsigned char stranger[32];
+	int kind0_before, kind1_before, kind7_before;
+	int author_notes, num_filters, i;
+	uint32_t reactions_before;
+	unsigned char *big_pubkeys;
+
+	// a note in test_counts.json that has reactions on it
+	const unsigned char reacted_id[] = {
+		0xd4, 0x4a, 0xd9, 0x6c, 0xb8, 0x92, 0x40, 0x92, 0xa7, 0x6b, 0xc2, 0xaf,
+		0xdd, 0xeb, 0x12, 0xeb, 0x85, 0x23, 0x3c, 0x0d, 0x03, 0xa7, 0xd9, 0xad,
+		0xc4, 0x2c, 0x2a, 0x85, 0xa7, 0x9a, 0x43, 0x05
+	};
+
+	memset(stranger, 0xfe, sizeof(stranger));
+
+	delete_test_db();
+	ndb_default_config(&config);
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	// profiles (kind 0) plus a mix of kind 1/6/7 notes
+	db_load_relay_events(ndb, "testdata/profiles.json");
+	db_load_events(ndb, "testdata/test_counts.json");
+
+	// a last-fetch row for a pubkey we have no profile for. it should not
+	// survive a prune, otherwise the client would never refetch it
+	assert(ndb_write_last_profile_fetch(ndb, stranger, 42));
+
+	// drain the writer queue so everything is committed before we prune
+	ndb_destroy(ndb);
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	kind0_before = prune_count_kind(ndb, 0);
+	kind1_before = prune_count_kind(ndb, 1);
+	kind7_before = prune_count_kind(ndb, 7);
+	assert(kind0_before > 0);
+	assert(kind1_before > 0);
+	assert(kind7_before > 0);
+
+	prune_first_author(ndb, 1, author);
+	author_notes = prune_count_author(ndb, author);
+	assert(author_notes > 0);
+	assert(author_notes < kind1_before);
+	assert(prune_last_fetch(ndb, stranger) == 42);
+
+	reactions_before = prune_total_reactions(ndb, reacted_id);
+	assert(reactions_before > 0);
+
+	// no filters is a plain copy: every note survives, kind 0 included
+	pruned = prune_into(ndb, &config, NULL, 0);
+	assert(prune_count_kind(pruned, 0) == kind0_before);
+	assert(prune_count_kind(pruned, 1) == kind1_before);
+	assert(prune_count_kind(pruned, 7) == kind7_before);
+	// the stranger has no profile, so its last-fetch row is dropped
+	assert(prune_last_fetch(pruned, stranger) == 0);
+	// kept reactions are re-counted, so the stats agree with the notes
+	assert(prune_total_reactions(pruned, reacted_id) == reactions_before);
+	prune_close(pruned);
+
+	// the default policy: all profiles, plus everything by our pubkeys
+	assert(ndb_prune_default_filters((const unsigned char (*)[32])author, 1,
+					 filters, ARRAY_SIZE(filters),
+					 &num_filters));
+	assert(num_filters == 2);
+
+	pruned = prune_into(ndb, &config, filters, num_filters);
+	assert(prune_count_kind(pruned, 0) == kind0_before);
+	assert(prune_count_author(pruned, author) == author_notes);
+	// notes matching neither filter are gone
+	assert(prune_count_kind(pruned, 1) < kind1_before);
+	assert(prune_count_kind(pruned, 7) == 0);
+	// our author kept its profile, so its last-fetch row would survive too
+	assert(prune_last_fetch(pruned, author) ==
+	       prune_last_fetch(ndb, author));
+	prune_close(pruned);
+
+	for (num_filters--; num_filters >= 0; num_filters--)
+		ndb_filter_destroy(&filters[num_filters]);
+
+	// with no pubkeys to keep we only emit the profiles filter, since an
+	// empty authors set would match nothing
+	assert(ndb_prune_default_filters(NULL, 0, filters, ARRAY_SIZE(filters),
+					 &num_filters));
+	assert(num_filters == 1);
+
+	pruned = prune_into(ndb, &config, filters, num_filters);
+	assert(prune_count_kind(pruned, 0) == kind0_before);
+	assert(prune_count_kind(pruned, 1) == 0);
+	assert(prune_count_kind(pruned, 7) == 0);
+	prune_close(pruned);
+
+	ndb_filter_destroy(&filters[0]);
+
+	// a policy that keeps no profiles drops their last-fetch rows as well
+	assert(ndb_filter_init(&kind7));
+	assert(ndb_filter_start_field(&kind7, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(&kind7, 7));
+	ndb_filter_end_field(&kind7);
+	assert(ndb_filter_end(&kind7));
+
+	pruned = prune_into(ndb, &config, &kind7, 1);
+	assert(prune_count_kind(pruned, 7) == kind7_before);
+	assert(prune_count_kind(pruned, 0) == 0);
+	assert(prune_count_kind(pruned, 1) == 0);
+	assert(prune_last_fetch(pruned, author) == 0);
+	prune_close(pruned);
+
+	ndb_filter_destroy(&kind7);
+
+	// an author set far larger than a filter's default capacity: the
+	// policy builder has to size the filter to fit it
+	big_pubkeys = malloc(BIG_PUBKEYS * 32);
+	assert(big_pubkeys);
+	for (i = 0; i < BIG_PUBKEYS; i++)
+		memset(big_pubkeys + i * 32, i & 0xff, 32);
+	memcpy(big_pubkeys + (BIG_PUBKEYS - 1) * 32, author, 32);
+
+	assert(ndb_prune_default_filters(
+			(const unsigned char (*)[32])big_pubkeys, BIG_PUBKEYS,
+			filters, ARRAY_SIZE(filters), &num_filters));
+	assert(num_filters == 2);
+
+	pruned = prune_into(ndb, &config, filters, num_filters);
+	assert(prune_count_author(pruned, author) == author_notes);
+	assert(prune_count_kind(pruned, 7) == 0);
+	prune_close(pruned);
+
+	ndb_filter_destroy(&filters[0]);
+	ndb_filter_destroy(&filters[1]);
+	free(big_pubkeys);
+
+	ndb_destroy(ndb);
+	delete_test_db();
+
+	printf("ok test_prune\n");
 }
 
 static void test_nip44_test_vector()
@@ -678,6 +969,158 @@ static void test_pns_reprocess()
 	ndb_filter_destroy(&filter);
 	ndb_destroy(ndb);
 	printf("ok test_pns_reprocess\n");
+}
+
+/* team_root = 0x11,0x00...0x00,0x22 ; matches enostr::sns derive_matches_fixed_vector */
+static unsigned char sns_team_root[32] = {
+	0x11,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x22
+};
+
+/* team pubkey derived from sns_team_root (the kind-1081 envelope author) */
+static const unsigned char sns_team_pub[32] = {
+	0xd6, 0x62, 0x35, 0x02, 0xbc, 0xf6, 0x7f, 0x67, 0x58, 0xe2,
+	0x50, 0x80, 0x11, 0x1a, 0xd9, 0x22, 0x11, 0x81, 0xc3, 0x3c,
+	0xfc, 0xba, 0x14, 0xd7, 0x4d, 0xc9, 0xe3, 0x78, 0x4e, 0xcf,
+	0xe1, 0xf7
+};
+
+/* member pubkey (secret key 0x02) that signs the inner seal + rumor */
+static const unsigned char sns_member_pub[32] = {
+	0xc6, 0x04, 0x7f, 0x94, 0x41, 0xed, 0x7d, 0x6d, 0x30, 0x45,
+	0x40, 0x6e, 0x95, 0xc0, 0x7c, 0xd8, 0x5c, 0x77, 0x8e, 0x4b,
+	0x8c, 0xef, 0x3c, 0xa7, 0xab, 0xac, 0x09, 0xb9, 0x5c, 0x70,
+	0x9e, 0xe5
+};
+
+/* kind-1081 envelope note id (for the UNWRAPPED / giftwrap_id assertions) */
+static const unsigned char sns_envelope_id[32] = {
+	0x99, 0xb8, 0x45, 0x9d, 0x77, 0xdd, 0x68, 0x73, 0xdd, 0xc4,
+	0xb1, 0x96, 0x96, 0xa5, 0x8e, 0xbf, 0xfc, 0x06, 0x76, 0x99,
+	0xe9, 0x22, 0x05, 0xdd, 0xff, 0xac, 0xa5, 0x7d, 0xbd, 0xe7,
+	0xed, 0xd9
+};
+
+/* A kind-1081 SNS envelope produced by enostr::sns::wrap_rumor with
+ * team_root = sns_team_root, member secret 0x02, and inner rumor
+ * {kind:1, content:"hello from sns"}. Signed by the shared team keypair,
+ * symmetric-encrypted with team_nip44_key, wrapping a kind-13 seal. */
+static const char *sns_envelope_json =
+	"{\"id\":\"99b8459d77dd6873ddc4b19696a58ebffc067699e92205ddffaca57dbde7edd9\",\"pubkey\":\"d6623502bcf67f6758e25080111ad9221181c33cfcba14d74dc9e3784ecfe1f7\",\"created_at\":1700000000,\"kind\":1081,\"tags\":[],\"content\":\"ArEfCumINQm1ORoUDeVy/6whNMlLXlux87U/T9fzTTl2+RS4lT3UUb4n9SR/MxOtHcmaq8TKjZGXOgTS/zghs+5cel/cPWWIwX6gZLkFSi3XVGczhG91MPFTph67G5Q/7XJq3DvWR6vJzqF0bXLd9YphI9gs3G7Za3eVtjgcwsvv9Qj+VKmRMQAVKnlksY+qj3BH8tudCm0N6QOJpR0GKw5VKFmvnq6ErnyIM8P+6IMw61sx8KqXMpgpe/ASxC89ZHJNSuf4VPwMaj6q3xuGgfxzI7QjpOfT/L3cca8j9DYK8zbpkT6VIHdXCTYkno3UdPh9Q+9HYjL/07F5+qurLiS0Oxem53YByzgiW3HKRkk/V+j3JyXLm+jNRVXH48+QS+oOUrpBrOYMmxhxd2XIAdTZpSJJMQ2d6u60XBiLeobLuBnSSOQnpKPxGLvTCfEgxX4yFyK1K7TeS5GlnVCnnWNAUFpfpMHhaS6tjt2/gpG9qKa3PSXdh0rSHudYE7Sum6XoreulfDVD6jWW6SscVKBNCG0cDzczRSdgvQ5sDr8S5M1boDvlCQfACWmkBJURFTLOvr/taTk5U+x5+Gdk6t46GteMFITALBPL2l1JEko06ahUk3DYxGdEGesh1+WwpnWjUiYhfTTJ13tzsjxjX2RDPdktRKsPCmfyOd74ooFwq9LaDcm9dAswJkpEmHPqHYdGwsIT68tH5SDMlXygUkqZ/Kt7W2jx0+JB3N3rck/lVWG+8yWfiJsyM5VysMFcvgNdFBslW+f5vK4EVu01zvriwILpuxhKGEl9VyPHPKBlY3IqL43uzZkFQHZvhGSB9WBF8JR2A6UtTWn9jyblkZgo+fyUY0CyX82pY39msDq72i0iHTzIqwZ4nU+kAbDB9xXJQ6W4BIGHXx/l0zIAn+pp0rLHlOMvnxj1iW6UVxZcY4RJBSKsK3xfNrs9xcwDtf+v5vtk0FiHbaRqUvbHKrOfxrBWIIQxsNtLy7dZuoQy3skIeD9uYyf/aqlye+6f+CnVF4WIkYMMlOorwA2EFnnSTiEuMcoaxozDt36dW4ThprAmued7w2cyUa/+jrxO5Z4CJMBAV8Q61s5GfRLd5XxqROj43CA4g7r2sKx2uKnJsiUZvHRH9205OAe9ZpqWW0WIBYRyRvuaEGeaoIJDE+oiPUk4wD1uovx01z0PxO6UsCsFk3P/4a22y6he/NvhClI115dsjvTwf/je78mnLqI0FJ02G7b1ZR7Isx9J5JzEPUqrFT2alsLxLMDix4bWe9mIgpbRfMejshl1vkx6MpwVx538bRrq05ahXarwuMSbREPR/IwoS+mJlTNsUtJ/dHYJXuvIkN3K3cl2zQ5RtWuMBfzX9giEezUydjslJWoZY3CWtA4wFMV6KO7viGJ2dFh/2FRR5dt4VhFotdZ5EmUxjMSzsr0gBuqDJAEfJ7bdGbQ=\",\"sig\":\"77b6dc3e2934d4771c76c4f6d0c76d204a2773450f541328ccccaeeae171f46d810b142708452a17d57bbfdf07c916e24d04c1378689c14ff3ab78e933dcfdef\"}";
+
+/* SNS envelope arrives after the team_root is already registered: it should
+ * auto-unwrap into the member's rumor on ingest. */
+static void test_sns_unwrap()
+{
+	struct ndb *ndb;
+	struct ndb_filter filter;
+	struct ndb_config config;
+	struct ndb_txn txn;
+	struct ndb_note *inner, *envelope;
+	int ok;
+	uint64_t subid;
+	uint64_t note_ids[2];
+	ndb_default_config(&config);
+
+	delete_test_db();
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	/* register the shared team_root before ingestion so it auto-unwraps */
+	ndb_add_team_root(ndb, sns_team_root);
+
+	/* subscribe for the kind-1 inner rumor */
+	kind_filter(&filter, 1);
+	subid = ndb_subscribe(ndb, &filter, 1);
+
+	ndb_process_event(ndb, sns_envelope_json, strlen(sns_envelope_json));
+
+	ok = ndb_wait_for_notes(ndb, subid, note_ids,
+				sizeof(note_ids)/sizeof(note_ids[0]));
+	assert(ok == 1);
+	assert(ndb_unsubscribe(ndb, subid));
+
+	ndb_begin_query(ndb, &txn);
+	inner = ndb_get_note_by_key(&txn, note_ids[0], NULL);
+	assert(inner);
+
+	assert(ndb_note_is_rumor(inner) == 1);
+	assert(ndb_note_kind(inner) == 1);
+	assert(!strcmp(ndb_note_content(inner), "hello from sns"));
+	/* authorship survives the wrap: the rumor is attributed to the member */
+	assert(!memcmp(ndb_note_pubkey(inner), sns_member_pub, 32));
+	/* the "receiver" of an SNS rumor is the shared team channel */
+	assert(!memcmp(ndb_note_rumor_receiver_pubkey(inner), sns_team_pub, 32));
+	assert(!memcmp(ndb_note_rumor_giftwrap_id(inner), sns_envelope_id, 32));
+	ndb_end_query(&txn);
+
+	/* verify the envelope is marked as unwrapped */
+	ndb_begin_query(ndb, &txn);
+	envelope = ndb_get_note_by_id(&txn, sns_envelope_id, NULL, NULL);
+	assert(envelope);
+	assert(*ndb_note_flags(envelope) & NDB_NOTE_FLAG_UNWRAPPED);
+	ndb_end_query(&txn);
+
+	ndb_filter_destroy(&filter);
+	ndb_destroy(ndb);
+	printf("ok test_sns_unwrap\n");
+}
+
+/* SNS envelope arrives before the team_root is registered: registering the
+ * root and calling ndb_process_sns should peel the stored envelope. */
+static void test_sns_reprocess()
+{
+	struct ndb *ndb;
+	struct ndb_filter filter;
+	struct ndb_config config;
+	struct ndb_txn txn;
+	struct ndb_note *inner;
+	int ok;
+	uint64_t subid;
+	uint64_t note_ids[2];
+	ndb_default_config(&config);
+
+	delete_test_db();
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	/* ingest the envelope BEFORE registering the team_root */
+	kind_filter(&filter, 1081);
+	subid = ndb_subscribe(ndb, &filter, 1);
+
+	ndb_process_event(ndb, sns_envelope_json, strlen(sns_envelope_json));
+
+	ok = ndb_wait_for_notes(ndb, subid, note_ids,
+				sizeof(note_ids)/sizeof(note_ids[0]));
+	assert(ok == 1);
+	assert(ndb_unsubscribe(ndb, subid));
+
+	/* now register the root and reprocess */
+	ndb_filter_destroy(&filter);
+	kind_filter(&filter, 1);
+	subid = ndb_subscribe(ndb, &filter, 1);
+
+	ndb_add_team_root(ndb, sns_team_root);
+	ndb_begin_query(ndb, &txn);
+	ndb_process_sns(ndb, &txn);
+	ndb_end_query(&txn);
+
+	ok = ndb_wait_for_notes(ndb, subid, note_ids,
+				sizeof(note_ids)/sizeof(note_ids[0]));
+	assert(ndb_unsubscribe(ndb, subid));
+
+	ndb_begin_query(ndb, &txn);
+	inner = ndb_get_note_by_key(&txn, note_ids[0], NULL);
+	assert(inner);
+
+	assert(ndb_note_is_rumor(inner) == 1);
+	assert(ndb_note_kind(inner) == 1);
+	assert(!strcmp(ndb_note_content(inner), "hello from sns"));
+	assert(!memcmp(ndb_note_pubkey(inner), sns_member_pub, 32));
+	assert(!memcmp(ndb_note_rumor_receiver_pubkey(inner), sns_team_pub, 32));
+	ndb_end_query(&txn);
+
+	ndb_filter_destroy(&filter);
+	ndb_destroy(ndb);
+	printf("ok test_sns_reprocess\n");
 }
 
 static void test_zap_verification()
@@ -1225,6 +1668,8 @@ static void test_timeline_query()
 	ndb_filter_destroy(&filter);
 
 	assert(count == 10);
+
+	ndb_destroy(ndb);
 }
 
 // Test fetched_at profile records. These are saved when new profiles are
@@ -1717,6 +2162,7 @@ static void test_replacement()
 	assert(!strcmp(name, "jb55"));
 
 	ndb_end_query(&txn);
+	ndb_destroy(ndb);
 
 	free(json);
 	free(buf);
@@ -2558,6 +3004,310 @@ static void test_multifilter_query()
 	ndb_destroy(ndb);
 }
 
+/* Every created_at ordered index in nostrdb is only ordered *within* a group
+ * (a kind, a pubkey+kind, a relay+kind). Query plans that span more than one
+ * group have to merge those groups, so this exercises the plans that do:
+ * created, kinds, author_kinds and relay_kinds. */
+
+#define ORDER_NOTES 60
+#define ORDER_BASE_TIME 1700000000
+
+// all non-replaceable, so every note we write sticks around
+static const uint64_t order_kinds[3] = { 1, 6, 7 };
+static const char *order_relays[2] = { "wss://relay.damus.io", "wss://nos.lol" };
+
+static uint64_t order_note_kind(int i)   { return order_kinds[i % 3]; }
+static int      order_note_author(int i) { return i % 2; }
+static int      order_note_relay(int i)  { return (i % 4) < 2 ? 0 : 1; }
+
+/* Note ids are deliberately uncorrelated with created_at: the note id index
+ * is clustered by id, so a plan that walks it expecting created_at order has
+ * to come back wrong here. Multiplying by an odd number mod 256 keeps these
+ * unique. */
+static int order_note_id(int i) { return ((i * 37) + 11) & 0xff; }
+
+/* Collect the notes we expect back, newest first. `want_*` of -1 means
+ * "don't care". Returns how many we expect. */
+static int order_expected(int *out, int max, int want_kind_a, int want_kind_b,
+			  int want_author, int want_relay)
+{
+	int i, n;
+	uint64_t kind;
+
+	for (i = ORDER_NOTES - 1, n = 0; i >= 0 && n < max; i--) {
+		kind = order_note_kind(i);
+
+		if (want_kind_a != -1 && kind != (uint64_t)want_kind_a &&
+		    kind != (uint64_t)want_kind_b)
+			continue;
+		if (want_author != -1 && order_note_author(i) != want_author)
+			continue;
+		if (want_relay != -1 && order_note_relay(i) != want_relay)
+			continue;
+
+		out[n++] = i;
+	}
+
+	return n;
+}
+
+/* Assert that a query came back as the newest `expected` notes in
+ * created_at-descending order. */
+static void order_check(const char *what, struct ndb_txn *txn,
+			struct ndb_filter *filter, int limit,
+			int want_kind_a, int want_kind_b,
+			int want_author, int want_relay)
+{
+	struct ndb_query_result results[ORDER_NOTES];
+	int expected[ORDER_NOTES];
+	int count, num_expected, i;
+
+	num_expected = order_expected(expected, limit, want_kind_a, want_kind_b,
+				      want_author, want_relay);
+
+	count = 0;
+	assert(ndb_query(txn, filter, 1, results, limit, &count));
+
+	if (count != num_expected) {
+		printf("%s: expected %d results, got %d\n", what,
+		       num_expected, count);
+		assert(!"wrong result count");
+	}
+
+	for (i = 0; i < count; i++) {
+		uint64_t got, want;
+
+		got = ndb_note_created_at(results[i].note);
+		want = ORDER_BASE_TIME + expected[i];
+
+		if (got != want) {
+			printf("%s: result %d created_at %" PRIu64
+			       ", expected %" PRIu64 "\n", what, i, got, want);
+			assert(!"query results out of order");
+		}
+	}
+}
+
+static void test_query_ordering()
+{
+	struct ndb *ndb;
+	struct ndb_txn txn;
+	struct ndb_config config;
+	struct ndb_filter filter, *f = &filter;
+	struct ndb_ingest_meta meta;
+	uint64_t note_ids[ORDER_NOTES], subid;
+	unsigned char author[32];
+	char json[1024];
+	int i, nres, attempts;
+
+	static const char *sig =
+		"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+		"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+	delete_test_db();
+	ndb_default_config(&config);
+	ndb_config_set_flags(&config, NDB_FLAG_SKIP_NOTE_VERIFY);
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	// subscribe so we can tell when everything has landed
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+	for (i = 0; i < 3; i++)
+		assert(ndb_filter_add_int_element(f, order_kinds[i]));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	assert((subid = ndb_subscribe(ndb, f, 1)));
+	ndb_filter_destroy(f);
+
+	// created_at increases with i, so "newest first" is just i descending
+	for (i = 0; i < ORDER_NOTES; i++) {
+		snprintf(json, sizeof(json),
+			 "[\"EVENT\",{\"id\":\"%064x\",\"pubkey\":\"%064x\","
+			 "\"created_at\":%d,\"kind\":%" PRIu64 ",\"tags\":[],"
+			 "\"content\":\"n%d\",\"sig\":\"%s\"}]",
+			 order_note_id(i), order_note_author(i) + 1,
+			 ORDER_BASE_TIME + i, order_note_kind(i), i, sig);
+
+		ndb_ingest_meta_init(&meta, 1,
+				     order_relays[order_note_relay(i)]);
+		assert(ndb_process_event_with(ndb, json, strlen(json), &meta));
+	}
+
+	// poll rather than block, so a missing note fails the test instead of
+	// hanging it
+	for (nres = 0, attempts = 0; nres < ORDER_NOTES && attempts < 500;
+	     attempts++) {
+		nres += ndb_poll_for_notes(ndb, subid, note_ids + nres,
+					   ORDER_NOTES - nres);
+		if (nres < ORDER_NOTES)
+			usleep(10000);
+	}
+	assert(nres == ORDER_NOTES);
+
+	// the relay index is written asynchronously after the note itself, so
+	// wait for every relay to show up before querying by relay
+	for (attempts = 0; attempts < 500; attempts++) {
+		int seen = 1;
+
+		assert(ndb_begin_query(ndb, &txn));
+		for (i = 0; i < ORDER_NOTES && seen; i++) {
+			unsigned char id[32] = {0};
+			uint64_t note_key;
+
+			id[31] = order_note_id(i); // the %064x id we ingested
+
+			seen = (note_key = ndb_get_notekey_by_id(&txn, id)) &&
+			       ndb_note_seen_on_relay(&txn, note_key,
+					order_relays[order_note_relay(i)]);
+		}
+		ndb_end_query(&txn);
+
+		if (seen)
+			break;
+		usleep(10000);
+	}
+	assert(attempts < 500);
+
+	assert(ndb_begin_query(ndb, &txn));
+
+	// NDB_PLAN_CREATED: no field to index on, must merge every kind
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_LIMIT));
+	assert(ndb_filter_add_int_element(f, 10));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	order_check("created", &txn, f, 10, -1, -1, -1, -1);
+	ndb_filter_destroy(f);
+
+	// NDB_PLAN_KINDS: merge kinds 1 and 7, skipping 30023
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(f, 1));
+	assert(ndb_filter_add_int_element(f, 7));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	order_check("kinds", &txn, f, 12, 1, 7, -1, -1);
+	ndb_filter_destroy(f);
+
+	// NDB_PLAN_AUTHOR_KINDS: merge one author across kinds 1 and 7
+	memset(author, 0, sizeof(author));
+	author[31] = 1; // author 0, matching the %064x pubkey above
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_AUTHORS));
+	assert(ndb_filter_add_id_element(f, author));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(f, 1));
+	assert(ndb_filter_add_int_element(f, 7));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	order_check("author_kinds", &txn, f, 8, 1, 7, 0, -1);
+	ndb_filter_destroy(f);
+
+	// NDB_PLAN_AUTHOR_KINDS with more than one author: merge every
+	// author*kind run. The third author has nothing in the db, so its
+	// scanners start empty and have to drop straight out of the heap.
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_AUTHORS));
+	memset(author, 0, sizeof(author));
+	author[31] = 1; // author 0
+	assert(ndb_filter_add_id_element(f, author));
+	author[31] = 2; // author 1
+	assert(ndb_filter_add_id_element(f, author));
+	author[31] = 3; // nobody
+	assert(ndb_filter_add_id_element(f, author));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(f, 1));
+	assert(ndb_filter_add_int_element(f, 7));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	// authors 0 and 1 between them wrote every note, so this is the same
+	// expected set as the kinds-only query above -- what's under test is
+	// that six merged runs still come back newest-first
+	order_check("multi_author_kinds", &txn, f, 12, 1, 7, -1, -1);
+	ndb_filter_destroy(f);
+
+	// the same plan under since/until bounds
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_AUTHORS));
+	author[31] = 1;
+	assert(ndb_filter_add_id_element(f, author));
+	author[31] = 2;
+	assert(ndb_filter_add_id_element(f, author));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(f, 1));
+	assert(ndb_filter_add_int_element(f, 7));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_start_field(f, NDB_FILTER_UNTIL));
+	assert(ndb_filter_add_int_element(f, ORDER_BASE_TIME + 39));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	{
+		struct ndb_query_result results[ORDER_NOTES];
+		int count = 0;
+		uint64_t prev;
+
+		assert(ndb_query(&txn, f, 1, results, ORDER_NOTES, &count));
+		assert(count > 0);
+
+		// until is exclusive in the index scan, as elsewhere here
+		prev = UINT64_MAX;
+		for (i = 0; i < count; i++) {
+			uint64_t at = ndb_note_created_at(results[i].note);
+			uint64_t kind = ndb_note_kind(results[i].note);
+
+			assert(at < (uint64_t)(ORDER_BASE_TIME + 39));
+			assert(kind == 1 || kind == 7);
+			assert(at <= prev);
+			prev = at;
+		}
+	}
+	ndb_filter_destroy(f);
+
+	// NDB_PLAN_RELAY_KINDS: merge one relay across kinds 1 and 7
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_RELAYS));
+	assert(ndb_filter_add_str_element(f, order_relays[0]));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(f, 1));
+	assert(ndb_filter_add_int_element(f, 7));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	order_check("relay_kinds", &txn, f, 8, 1, 7, -1, 0);
+	ndb_filter_destroy(f);
+
+	// since/until should bound the merged scan, not truncate it at the
+	// first out-of-range group
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_UNTIL));
+	assert(ndb_filter_add_int_element(f, ORDER_BASE_TIME + 39));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_start_field(f, NDB_FILTER_SINCE));
+	assert(ndb_filter_add_int_element(f, ORDER_BASE_TIME + 35));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	{
+		struct ndb_query_result results[ORDER_NOTES];
+		int count = 0;
+
+		assert(ndb_query(&txn, f, 1, results, ORDER_NOTES, &count));
+
+		// notes 35..39 inclusive, newest first. until is exclusive in
+		// the index scan, so 39 itself is not expected here
+		assert(count == 4);
+		for (i = 0; i < count; i++)
+			assert(ndb_note_created_at(results[i].note) ==
+			       (uint64_t)(ORDER_BASE_TIME + 38 - i));
+	}
+	ndb_filter_destroy(f);
+
+	ndb_end_query(&txn);
+	ndb_destroy(ndb);
+}
+
 static void test_multifilter_query_fair_distribution()
 {
 	struct ndb *ndb;
@@ -2886,6 +3636,7 @@ static void test_filter_is_subset() {
 	assert(ndb_filter_is_subset_of(ki, k) == 1);
 	assert(ndb_filter_is_subset_of(k, ki) == 0);
 
+	ndb_filter_destroy(g);
 	ndb_filter_destroy(k);
 	ndb_filter_destroy(ki);
 }
@@ -3222,6 +3973,8 @@ int main(int argc, const char *argv[]) {
 	test_giftwrap_unwrap();
 	test_pns_unwrap();
 	test_pns_reprocess();
+	test_sns_unwrap();
+	test_sns_reprocess();
 	test_zap_verification();
 	test_multiple_zaps();
 	test_nip44_round_trip();
@@ -3231,6 +3984,7 @@ int main(int argc, const char *argv[]) {
 	test_custom_filter();
 	test_metadata();
 	test_count_metadata();
+	test_prune();
 	test_reaction_encoding();
 	test_reaction_counter();
 	test_note_relay_index();
@@ -3244,6 +3998,7 @@ int main(int argc, const char *argv[]) {
 	test_single_url_parsing();
 	test_url_parsing();
 	test_query();
+	test_query_ordering();
 	test_multifilter_query();
 	test_multifilter_query_fair_distribution();
 	test_tag_query();
