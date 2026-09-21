@@ -1472,7 +1472,9 @@ static int ndb_filter_matches_with(struct ndb_filter *filter,
 			break;
 		case NDB_FILTER_UNTIL:
 			assert(els->count == 1);
-			if (note->created_at < els->elements[0])
+			// NIP-01: since <= created_at <= until. the index
+			// seeks in the query plans already treat it that way
+			if (note->created_at <= els->elements[0])
 				continue;
 			break;
 		case NDB_FILTER_SEARCH:

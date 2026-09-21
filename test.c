@@ -3572,6 +3572,47 @@ static void test_weird_note_corruption() {
 	ndb_destroy(ndb);
 }
 
+// since and until are both inclusive bounds. the query plans seek the index
+// at until inclusively; the in-memory matcher used to treat it as exclusive,
+// so a subscription (or a plan's post-filter) dropped notes created exactly
+// at until while a direct id lookup returned them
+static void test_filter_until_inclusive() {
+	struct ndb_filter filter, *f = &filter;
+	struct ndb_note *note;
+	unsigned char buffer[4096];
+
+	const char *test_note = "{\"id\": \"160e76ca67405d7ce9ef7d2dd72f3f36401c8661a73d45498af842d40b01b736\",\"pubkey\": \"67c67870aebc327eb2a2e765e6dbb42f0f120d2c4e4e28dc16b824cf72a5acc1\",\"created_at\": 1700688516,\"kind\": 1337,\"tags\": [],\"content\": \"\",\"sig\": \"20c2d070261ed269559ada40ca5ac395c389681ee3b5f7d50de19dd9b328dd70cf27d9d13875e87c968d9b49fa05f66e90f18037be4529b9e582c7e2afac3f06\"}";
+
+	assert(ndb_note_from_json(test_note, strlen(test_note), &note, buffer, sizeof(buffer)));
+
+	// until == created_at matches
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_UNTIL));
+	assert(ndb_filter_add_int_element(f, 1700688516));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	assert(ndb_filter_matches(f, note));
+	ndb_filter_destroy(f);
+
+	// until == created_at - 1 does not
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_UNTIL));
+	assert(ndb_filter_add_int_element(f, 1700688515));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	assert(!ndb_filter_matches(f, note));
+	ndb_filter_destroy(f);
+
+	// and since == created_at still matches, as it always did
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_SINCE));
+	assert(ndb_filter_add_int_element(f, 1700688516));
+	ndb_filter_end_field(f);
+	assert(ndb_filter_end(f));
+	assert(ndb_filter_matches(f, note));
+	ndb_filter_destroy(f);
+}
+
 static void test_filter_eq() {
 	struct ndb_filter filter, *f = &filter;
 	struct ndb_filter filter2, *f2 = &filter2;
@@ -3992,6 +4033,7 @@ int main(int argc, const char *argv[]) {
 	test_filter_parse_search_json();
 	test_parse_filter_json();
 	test_filter_eq();
+	test_filter_until_inclusive();
 	test_filter_is_subset();
 	test_filter_json();
 	test_bech32_parsing();
