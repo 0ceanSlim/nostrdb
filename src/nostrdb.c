@@ -365,6 +365,11 @@ struct ndb_monitor {
 // cross-thread from Go, so accessed via atomics.
 static uint64_t ndb_write_errors_total = 0;
 
+static inline void ndb_write_failed(void)
+{
+	__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
+}
+
 struct ndb {
 	struct ndb_lmdb lmdb;
 	struct ndb_ingester ingester;
@@ -1707,6 +1712,7 @@ static int ndb_write_profile_search_index(struct ndb_txn *txn,
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_PROFILE_SEARCH],
 			  &key, &val, 0)))
 	{
+		ndb_write_failed();
 		ndb_debug("ndb_write_profile_search_index failed: %s\n",
 			  mdb_strerror(rc));
 		return 0;
@@ -1899,6 +1905,7 @@ static int ndb_write_note_relay(struct ndb_txn *txn, uint64_t note_key,
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_RELAYS],
 			  &k, &v, MDB_NODUPDATA)))
 	{
+		ndb_write_failed();
 		ndb_debug("ndb_write_note_relay failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -2024,7 +2031,7 @@ static int ndb_write_note_relay_kind_index(
 	v.mv_size = 0;
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_RELAY_KIND], &k, &v, 0))) {
-		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
+		ndb_write_failed();
 		fprintf(stderr, "write note relay kind index failed: %s\n",
 			  mdb_strerror(rc));
 		return 0;
@@ -2057,7 +2064,7 @@ static int ndb_write_note_pubkey_index(struct ndb_txn *txn, struct ndb_note *not
 	v.mv_size = sizeof(note_key);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_PUBKEY], &k, &v, 0))) {
-		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
+		ndb_write_failed();
 		fprintf(stderr, "write note pubkey index failed: %s\n",
 			  mdb_strerror(rc));
 		return 0;
@@ -2084,7 +2091,7 @@ static int ndb_write_note_pubkey_kind_index(struct ndb_txn *txn,
 	v.mv_size = sizeof(note_key);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_PUBKEY_KIND], &k, &v, 0))) {
-		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
+		ndb_write_failed();
 		fprintf(stderr, "write note pubkey_kind index failed: %s\n",
 			  mdb_strerror(rc));
 		return 0;
@@ -2643,6 +2650,7 @@ static int ndb_migrate_metadata(struct ndb_txn *txn)
 
 		/* set entry */
 		if ((rc = mdb_put(txn->mdb_txn, meta_db, &k2, &v2, 0))) {
+			ndb_write_failed();
 			ndb_debug("migrate metadata entry failed on write: %s\n", mdb_strerror(rc));
 		}
 
@@ -3115,6 +3123,7 @@ static void ndb_writer_last_profile_fetch(struct ndb_txn *txn,
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_PROFILE_LAST_FETCH],
 			  &key, &val, 0)))
 	{
+		ndb_write_failed();
 		ndb_debug("write version to ndb_meta failed: %s\n",
 				mdb_strerror(rc));
 		return;
@@ -4056,6 +4065,7 @@ static int ndb_write_profile_pk_index(struct ndb_txn *txn, struct ndb_note *note
 	val.mv_size = sizeof(profile_key);
 
 	if ((rc = mdb_put(txn->mdb_txn, pk_db, &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write profile_pk(%" PRIu64 ") to db failed: %s\n",
 				profile_key, mdb_strerror(rc));
 		return 0;
@@ -4106,6 +4116,7 @@ static int ndb_write_profile(struct ndb_txn *txn,
 	val.mv_size = flatbuf_len;
 
 	if ((rc = mdb_put(txn->mdb_txn, profile_db, &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write profile to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -4160,6 +4171,7 @@ int ndb_writer_set_note_meta(struct ndb_txn *txn, const unsigned char *id, struc
 	v.mv_size = ndb_note_meta_total_size(meta);
 
 	if ((rc = mdb_put(txn->mdb_txn, note_meta_db, &k, &v, 0))) {
+		ndb_write_failed();
 		ndb_debug("ndb_set_note_meta: write note metadata to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -4246,6 +4258,7 @@ static int ndb_process_reaction(
 	assert((val.mv_size % 8) == 0);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_META], &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write reaction stats to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -4292,6 +4305,7 @@ static int ndb_increment_total_reactions(
 	assert((val.mv_size % 8) == 0);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_META], &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write reaction stats to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -4388,6 +4402,7 @@ static int ndb_write_unverified_zap_stats(struct ndb_txn *txn,
 	assert((val.mv_size % 8) == 0);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_META], &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write unverified zap stats to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -4437,6 +4452,7 @@ static int ndb_write_note_id_index(struct ndb_txn *txn, struct ndb_note *note,
 	id_db = txn->lmdb->dbs[NDB_DB_NOTE_ID];
 
 	if ((rc = mdb_put(txn->mdb_txn, id_db, &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write note id index to db failed: %s\n",
 				mdb_strerror(rc));
 		return 0;
@@ -6031,6 +6047,7 @@ static int ndb_write_note_tag_index(struct ndb_txn *txn, struct ndb_note *note,
 		val.mv_size = sizeof(note_key);
 
 		if ((rc = mdb_put(txn->mdb_txn, tags_db, &key, &val, 0))) {
+			ndb_write_failed();
 			ndb_debug("write note tag index to db failed: %s\n",
 					mdb_strerror(rc));
 			return 0;
@@ -6058,6 +6075,7 @@ static int ndb_write_note_kind_index(struct ndb_txn *txn, struct ndb_note *note,
 	kind_db = txn->lmdb->dbs[NDB_DB_NOTE_KIND];
 
 	if ((rc = mdb_put(txn->mdb_txn, kind_db, &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write note kind index to db failed: %s\n",
 				mdb_strerror(rc));
 		return 0;
@@ -6094,6 +6112,7 @@ static int ndb_write_word_to_index(struct ndb_txn *txn, const char *word,
 	text_db = txn->lmdb->dbs[NDB_DB_NOTE_TEXT];
 
 	if ((rc = mdb_put(txn->mdb_txn, text_db, &k, &v, 0))) {
+		ndb_write_failed();
 		ndb_debug("write note text index to db failed: %s\n",
 				mdb_strerror(rc));
 		return 0;
@@ -6676,6 +6695,7 @@ static void ndb_write_blocks(struct ndb_txn *txn, uint64_t note_key,
 	assert((val.mv_size % 8) == 0);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_BLOCKS], &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write version to note_blocks failed: %s\n",
 				mdb_strerror(rc));
 		return;
@@ -6767,6 +6787,7 @@ static int ndb_increment_quote_metadata(
 	assert((val.mv_size % 8) == 0);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_META], &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write reaction stats to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -6814,6 +6835,7 @@ static int ndb_increment_direct_reply_metadata(
 	assert((val.mv_size % 8) == 0);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_META], &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write reaction stats to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -6861,6 +6883,7 @@ static int ndb_increment_thread_reply_metadata(
 	assert((val.mv_size % 8) == 0);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_META], &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write reaction stats to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -6908,6 +6931,7 @@ static int ndb_increment_repost_metadata(
 	assert((val.mv_size % 8) == 0);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_META], &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write reaction stats to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -7002,6 +7026,14 @@ static int handle_reprocessed_giftwrap(
 	return ndb_writer_queue_msg(writer_inbox, &msg);
 }
 
+// Kinds whose content is tokenized into NDB_DB_NOTE_TEXT (and parsed into
+// NDB_DB_NOTE_BLOCKS). Shared by the write path and the grain delete path so
+// the two can never disagree about which notes carry fulltext rows.
+static inline int ndb_kind_is_fulltext(uint64_t kind)
+{
+	return kind == 1 || kind == 30023;
+}
+
 static uint64_t ndb_write_note(secp256k1_context *secp,
 			       struct ndb_txn *txn,
 			       struct ndb_writer_note *note,
@@ -7071,7 +7103,7 @@ static uint64_t ndb_write_note(secp256k1_context *secp,
 	val.mv_size = note->note_len;
 
 	if ((rc = mdb_put(txn->mdb_txn, note_db, &key, &val, 0))) {
-		__atomic_fetch_add(&ndb_write_errors_total, 1, __ATOMIC_RELAXED);
+		ndb_write_failed();
 		ndb_debug("write note to db failed: %s\n", mdb_strerror(rc));
 		return 0;
 	}
@@ -7086,7 +7118,7 @@ static uint64_t ndb_write_note(secp256k1_context *secp,
 		ndb_write_note_relay_indexes(txn, &relay_key);
 
 	// only parse content and do fulltext index on text and longform notes
-	if (kind == 1 || kind == 30023) {
+	if (ndb_kind_is_fulltext(kind)) {
 		if (!ndb_flag_set(ndb_flags, NDB_FLAG_NO_FULLTEXT)) {
 			if (!ndb_write_note_fulltext_index(txn, note->note, note_key))
 				return 0;
@@ -7826,6 +7858,7 @@ static int ndb_write_version(struct ndb_txn *txn, uint64_t version)
 	val.mv_size = sizeof(version);
 
 	if ((rc = mdb_put(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NDB_META], &key, &val, 0))) {
+		ndb_write_failed();
 		ndb_debug("write version to ndb_meta failed: %s\n",
 				mdb_strerror(rc));
 		return 0;
@@ -7884,41 +7917,149 @@ static int ndb_run_migrations(struct ndb_txn *txn)
 // ============================================================================
 //
 // ndb_delete_note_by_id physically removes an event from the database,
-// reversing the writes performed by ndb_write_note. It runs inside the writer
-// thread's write txn so it shares commit semantics with ingest — a batch that
+// reversing every write performed by ndb_write_note. It runs inside the writer
+// thread's write txn so it shares commit semantics with ingest: a batch that
 // contains both an ingest and a delete of the same id is ordered FIFO and
 // committed atomically.
 //
-// Sub-DBs covered (reverse of ndb_write_note fan-out):
+// Sub-DBs covered, in the order they are touched:
 //   - NDB_DB_NOTE_PUBKEY_KIND   (direct mdb_del, dup-value)
 //   - NDB_DB_NOTE_PUBKEY        (direct mdb_del, dup-value)
 //   - NDB_DB_NOTE_TAGS          (iterate tags, recompute each key, mdb_del)
 //   - NDB_DB_NOTE_KIND          (direct mdb_del, dup-value)
+//   - NDB_DB_NOTE_RELAY_KIND    (one exact key per relay listed under the
+//                                note in NOTE_RELAYS; the key is not
+//                                note_key-prefixed, so it is rebuilt rather
+//                                than cursor-walked)
 //   - NDB_DB_NOTE_RELAYS        (mdb_del with NULL val removes all dups)
+//   - NDB_DB_NOTE_TEXT          (re-tokenize the content with the same word
+//                                parser the write side used and mdb_del each
+//                                key; only for ndb_kind_is_fulltext kinds)
+//   - NDB_DB_NOTE_BLOCKS        (direct mdb_del by note_key)
 //   - NDB_DB_NOTE_ID            (direct mdb_del, dup-value)
 //   - NDB_DB_NOTE               (primary, direct mdb_del by note_key, last)
 //
-// Deliberately NOT covered in v0.5.0:
-//   - NDB_DB_NOTE_RELAY_KIND: variable-length composite key prefixed with
-//     note_key. Cursor-walk deletion is possible but requires care around
-//     ndb_relay_kind_cmp. Stale entries produce query results whose note_key
-//     points at a deleted primary — grain's query loop already skips these
-//     via the `result.note == nil` check, so correctness is preserved.
-//   - NDB_DB_NOTE_TEXT: per-word compressed keys. Reconstructing each key
-//     requires re-parsing the note content. Stale entries are filtered by
-//     the same nil-note skip.
-//   - NDB_DB_NOTE_BLOCKS: parsed block cache; stale entries are harmless.
-//   - Per-kind stats counters (reactions, reposts): cosmetic drift, not
-//     visible to clients via the relay protocol.
+// Deliberately NOT reversed:
+//   - Per-note stats (reaction/repost/zap counters in NDB_DB_META). Those are
+//     aggregates on the *referenced* note, maintained by parsing the reacting
+//     note; unwinding them means re-deriving that logic per kind. They are not
+//     visible through the relay protocol, so a deleted reaction leaves a
+//     cosmetic drift in a counter nothing reads.
 //
-// The primary note row is deleted LAST. If the writer thread crashes
-// mid-batch, LMDB rolls the whole txn back atomically; partial delete state
-// is never visible on disk.
+// Every index delete tolerates MDB_NOTFOUND: an index row that was never
+// written (fulltext disabled, relay-less ingest, oversized tag) is simply
+// absent. The primary note row is deleted LAST. If the writer thread crashes
+// mid-batch, LMDB rolls the whole txn back atomically; partial delete state is
+// never visible on disk.
 //
-// The note body is read from NDB_DB_NOTE at the start and all field
-// references (pubkey, kind, created_at, tags) are snapshotted or used
-// before any mutation, so LMDB's within-txn data-stability guarantee
-// keeps the `struct ndb_note *` pointer valid until the primary delete.
+// The note body is read from NDB_DB_NOTE at the start and every field the
+// index deletes need is used before the primary delete, so LMDB's within-txn
+// data-stability guarantee keeps the `struct ndb_note *` pointer valid until
+// that final step.
+
+struct ndb_word_deleter_ctx {
+	struct ndb_txn *txn;
+	uint64_t created_at;
+	uint64_t note_key;
+};
+
+// The mirror of ndb_fulltext_word_writer. ndb_parse_words only advances its
+// word index when the callback returns 1, so this must return exactly what the
+// writer returned for the same word — 0 only when the key cannot be built —
+// or the reconstructed word_index values drift from the ones on disk.
+static int ndb_fulltext_word_deleter(void *ctx,
+		const char *word, int word_len, int words)
+{
+	struct ndb_word_deleter_ctx *dctx = ctx;
+	unsigned char buffer[1024];
+	int keysize, rc;
+	MDB_val k;
+
+	if (!ndb_make_text_search_key(buffer, sizeof(buffer), words,
+				      word_len, word, dctx->created_at,
+				      dctx->note_key, &keysize))
+		return 0;
+
+	k.mv_data = buffer;
+	k.mv_size = keysize;
+
+	rc = mdb_del(dctx->txn->mdb_txn,
+		     dctx->txn->lmdb->dbs[NDB_DB_NOTE_TEXT], &k, NULL);
+	if (rc && rc != MDB_NOTFOUND) {
+		ndb_debug("ndb_delete_note_by_id: note_text del '%.*s': %s\n",
+			  word_len, word, mdb_strerror(rc));
+	}
+
+	return 1;
+}
+
+static void ndb_delete_note_fulltext(struct ndb_txn *txn,
+				     struct ndb_note *note,
+				     uint64_t note_key)
+{
+	struct cursor cur;
+	unsigned char *content;
+	struct ndb_str str;
+	struct ndb_word_deleter_ctx ctx;
+
+	str = ndb_note_str(note, &note->content);
+	if (unlikely(str.flag == NDB_PACKED_ID))
+		return;
+
+	content = (unsigned char *)str.str;
+	make_cursor(content, content + note->content_length, &cur);
+
+	ctx.txn = txn;
+	ctx.created_at = ndb_note_created_at(note);
+	ctx.note_key = note_key;
+
+	ndb_parse_words(&cur, &ctx, ndb_fulltext_word_deleter);
+}
+
+// Walk the relays recorded for this note in NOTE_RELAYS and delete the
+// matching NOTE_RELAY_KIND row for each. Must run before NOTE_RELAYS itself is
+// cleared, since that is the only record of which relay keys were written.
+static void ndb_delete_note_relay_kinds(struct ndb_txn *txn,
+					uint64_t note_key, uint64_t kind,
+					uint64_t created_at)
+{
+	MDB_cursor *cur;
+	MDB_val k, v, rk;
+	struct ndb_relay_kind_key relay_key;
+	unsigned char buf[256];
+	int rc, len;
+
+	if (mdb_cursor_open(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE_RELAYS], &cur))
+		return;
+
+	k.mv_data = &note_key;
+	k.mv_size = sizeof(note_key);
+
+	rc = mdb_cursor_get(cur, &k, &v, MDB_SET_KEY);
+	while (rc == MDB_SUCCESS) {
+		// NOTE_RELAYS values are null-terminated urls padded to 8
+		// bytes, so the string's own length is the relay_len the
+		// write side used
+		if (ndb_relay_kind_key_init(&relay_key, note_key, kind,
+					    created_at, (const char *)v.mv_data) &&
+		    (len = ndb_build_relay_kind_key(buf, sizeof(buf), &relay_key)))
+		{
+			rk.mv_data = buf;
+			rk.mv_size = len;
+			rc = mdb_del(txn->mdb_txn,
+				     txn->lmdb->dbs[NDB_DB_NOTE_RELAY_KIND],
+				     &rk, NULL);
+			if (rc && rc != MDB_NOTFOUND) {
+				ndb_debug("ndb_delete_note_by_id: relay_kind del '%s': %s\n",
+					  (const char *)v.mv_data, mdb_strerror(rc));
+			}
+		}
+		rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT_DUP);
+	}
+
+	mdb_cursor_close(cur);
+}
+
 static int ndb_delete_note_by_id(struct ndb_txn *txn, const unsigned char *id)
 {
 	uint64_t note_key = 0;
@@ -7938,14 +8079,14 @@ static int ndb_delete_note_by_id(struct ndb_txn *txn, const unsigned char *id)
 		return 0;
 	}
 
-	// 2. Snapshot all fields we need so the deletes below don't depend on
-	//    the stability of the `note` pointer beyond the current txn.
+	// 2. Snapshot the scalar fields so the deletes below don't depend on
+	//    the `note` pointer beyond the primary delete.
 	created_at = ndb_note_created_at(note);
 	kind = ndb_note_kind(note);
 	memcpy(pk_copy, ndb_note_pubkey(note), 32);
 	memcpy(id_copy, id, 32);
 
-	// 3. Delete NDB_DB_NOTE_PUBKEY_KIND entry.
+	// 3. NDB_DB_NOTE_PUBKEY_KIND
 	{
 		struct ndb_id_u64_ts pkk;
 		ndb_id_u64_ts_init(&pkk, pk_copy, kind, created_at);
@@ -7961,7 +8102,7 @@ static int ndb_delete_note_by_id(struct ndb_txn *txn, const unsigned char *id)
 		}
 	}
 
-	// 4. Delete NDB_DB_NOTE_PUBKEY entry.
+	// 4. NDB_DB_NOTE_PUBKEY
 	{
 		struct ndb_tsid pk_tsid;
 		ndb_tsid_init(&pk_tsid, pk_copy, created_at);
@@ -7977,9 +8118,9 @@ static int ndb_delete_note_by_id(struct ndb_txn *txn, const unsigned char *id)
 		}
 	}
 
-	// 5. Delete NDB_DB_NOTE_TAGS entries — one per single-char indexed
-	//    tag, keys reconstructed via the same ndb_encode_tag_key used by
-	//    the write side.
+	// 5. NDB_DB_NOTE_TAGS — one per single-char indexed tag, keys
+	//    reconstructed via the same ndb_encode_tag_key used by the write
+	//    side.
 	{
 		struct ndb_iterator iter;
 		unsigned char tag_key_buf[255];
@@ -8018,7 +8159,7 @@ static int ndb_delete_note_by_id(struct ndb_txn *txn, const unsigned char *id)
 		}
 	}
 
-	// 6. Delete NDB_DB_NOTE_KIND entry.
+	// 6. NDB_DB_NOTE_KIND
 	{
 		struct ndb_u64_ts kts;
 		ndb_u64_ts_init(&kts, kind, created_at);
@@ -8034,8 +8175,11 @@ static int ndb_delete_note_by_id(struct ndb_txn *txn, const unsigned char *id)
 		}
 	}
 
-	// 7. Delete all NDB_DB_NOTE_RELAYS dup values for this note_key.
-	//    Passing NULL as the value removes every duplicate under this key.
+	// 7. NDB_DB_NOTE_RELAY_KIND, driven by the NOTE_RELAYS dups — so it
+	//    has to happen before step 8 clears them.
+	ndb_delete_note_relay_kinds(txn, note_key, kind, created_at);
+
+	// 8. NDB_DB_NOTE_RELAYS — NULL value removes every dup under the key.
 	{
 		k.mv_data = &note_key;
 		k.mv_size = sizeof(note_key);
@@ -8047,7 +8191,23 @@ static int ndb_delete_note_by_id(struct ndb_txn *txn, const unsigned char *id)
 		}
 	}
 
-	// 8. Delete NDB_DB_NOTE_ID entry.
+	// 9. NDB_DB_NOTE_TEXT and NDB_DB_NOTE_BLOCKS, only for kinds the write
+	//    side indexes. Deleting an absent row (NDB_FLAG_NO_FULLTEXT /
+	//    NDB_FLAG_NO_NOTE_BLOCKS at write time) is a harmless NOTFOUND.
+	if (ndb_kind_is_fulltext(kind)) {
+		ndb_delete_note_fulltext(txn, note, note_key);
+
+		k.mv_data = &note_key;
+		k.mv_size = sizeof(note_key);
+		rc = mdb_del(txn->mdb_txn,
+			     txn->lmdb->dbs[NDB_DB_NOTE_BLOCKS], &k, NULL);
+		if (rc && rc != MDB_NOTFOUND) {
+			ndb_debug("ndb_delete_note_by_id: note_blocks del: %s\n",
+				  mdb_strerror(rc));
+		}
+	}
+
+	// 10. NDB_DB_NOTE_ID
 	{
 		struct ndb_tsid id_tsid;
 		ndb_tsid_init(&id_tsid, id_copy, created_at);
@@ -8063,8 +8223,8 @@ static int ndb_delete_note_by_id(struct ndb_txn *txn, const unsigned char *id)
 		}
 	}
 
-	// 9. Delete the primary NDB_DB_NOTE row. This invalidates the `note`
-	//    pointer — do nothing else with it after this point.
+	// 11. The primary NDB_DB_NOTE row. This invalidates the `note`
+	//     pointer — do nothing else with it after this point.
 	k.mv_data = &note_key;
 	k.mv_size = sizeof(note_key);
 	rc = mdb_del(txn->mdb_txn, txn->lmdb->dbs[NDB_DB_NOTE], &k, NULL);
@@ -8095,13 +8255,39 @@ int ndb_request_delete_note(struct ndb *ndb, const unsigned char *id)
 // end grain fork: real delete support
 // ============================================================================
 
+// release the heap payloads a popped writer batch owns, whether or not the
+// batch made it into a txn
+static void ndb_writer_free_msgs(struct ndb_writer_msg *msgs, int popped)
+{
+	struct ndb_writer_msg *msg;
+	int i;
+
+	for (i = 0; i < popped; i++) {
+		msg = &msgs[i];
+		if (msg->type == NDB_WRITER_NOTE) {
+			free(msg->note.note);
+			if (msg->note.relay)
+				free((void*)msg->note.relay);
+		} else if (msg->type == NDB_WRITER_PROFILE) {
+			free(msg->profile.note.note);
+			ndb_profile_record_builder_free(&msg->profile.record);
+		} else if (msg->type == NDB_WRITER_BLOCKS) {
+			ndb_blocks_free(msg->blocks.blocks);
+		} else if (msg->type == NDB_WRITER_NOTE_RELAY) {
+			free((void*)msg->note_relay.relay);
+		} else if (msg->type == NDB_WRITER_NOTE_META) {
+			free(msg->note_meta.metadata);
+		}
+	}
+}
+
 static void *ndb_writer_thread(void *data)
 {
 	ndb_debug("started writer thread\n");
 	struct ndb_writer *writer = data;
 	struct ndb_writer_msg msgs[THREAD_QUEUE_BATCH], *msg;
 	struct written_note written_notes[THREAD_QUEUE_BATCH];
-	int i, popped, done, needs_commit, num_notes;
+	int i, popped, done, needs_commit, num_notes, rc;
 	uint64_t note_nkey;
 	struct ndb_txn txn;
 	unsigned char *scratch;
@@ -8141,11 +8327,22 @@ static void *ndb_writer_thread(void *data)
 			}
 		}
 
-		if (needs_commit && mdb_txn_begin(txn.lmdb->env, NULL, 0, (MDB_txn **)&txn.mdb_txn))
+		if (needs_commit && (rc = mdb_txn_begin(txn.lmdb->env, NULL, 0, (MDB_txn **)&txn.mdb_txn)))
 		{
-			fprintf(stderr, "writer thread txn_begin failed");
+			fprintf(stderr, "writer thread txn_begin failed: %s\n", mdb_strerror(rc));
 			// should definitely not happen unless DB is full
-			// or something ?
+			// or something ? every write in this batch is lost,
+			// so count each one and release its payload. a quit
+			// in the batch still has to take effect, or the
+			// join in ndb_destroy never returns
+			for (i = 0; i < popped; i++) {
+				msg = &msgs[i];
+				if (msg->type == NDB_WRITER_QUIT)
+					done = 1;
+				else
+					ndb_write_failed();
+			}
+			ndb_writer_free_msgs(msgs, popped);
 			continue;
 		}
 
@@ -8237,8 +8434,16 @@ static void *ndb_writer_thread(void *data)
 
 		// commit writes
 		if (needs_commit) {
-			if (!ndb_end_query(&txn)) {
-				ndb_debug("writer thread txn commit failed\n");
+			if ((rc = mdb_txn_commit(txn.mdb_txn))) {
+				// the whole batch is rolled back: MDB_MAP_FULL
+				// surfaces here as readily as at mdb_put, and
+				// without a count the loss is invisible
+				fprintf(stderr, "writer thread txn commit failed: %s\n", mdb_strerror(rc));
+				for (i = 0; i < popped; i++) {
+					msg = &msgs[i];
+					if (msg->type != NDB_WRITER_QUIT)
+						ndb_write_failed();
+				}
 			} else {
 				ndb_debug("commit write thead txn. notifying subscriptions, %d notes\n", num_notes);
 				ndb_notify_subscriptions(writer->monitor,
@@ -8248,24 +8453,7 @@ static void *ndb_writer_thread(void *data)
 			}
 		}
 
-		// free notes
-		for (i = 0; i < popped; i++) {
-			msg = &msgs[i];
-			if (msg->type == NDB_WRITER_NOTE) {
-				free(msg->note.note);
-				if (msg->note.relay)
-					free((void*)msg->note.relay);
-			} else if (msg->type == NDB_WRITER_PROFILE) {
-				free(msg->profile.note.note);
-				ndb_profile_record_builder_free(&msg->profile.record);
-			} else if (msg->type == NDB_WRITER_BLOCKS) {
-				ndb_blocks_free(msg->blocks.blocks);
-			} else if (msg->type == NDB_WRITER_NOTE_RELAY) {
-				free((void*)msg->note_relay.relay);
-			} else if (msg->type == NDB_WRITER_NOTE_META) {
-				free(msg->note_meta.metadata);
-			}
-		}
+		ndb_writer_free_msgs(msgs, popped);
 	}
 
 bail:
