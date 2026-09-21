@@ -329,9 +329,18 @@ struct ndb_filter_custom {
 	ndb_filter_callback_fn *cb;
 };
 
+// grain fork: an id or author element with a hex-prefix length. NIP-01 lets
+// `ids` and `authors` entries be a prefix of the 64-char hex value; nibbles
+// is how many hex chars are significant (64 for a full id).
+struct ndb_filter_id_prefix {
+	const unsigned char *id;
+	int nibbles;
+};
+
 union ndb_filter_element {
 	struct ndb_filter_string string;
 	const unsigned char *id;
+	struct ndb_filter_id_prefix id_prefix;
 	uint64_t integer;
 	struct ndb_filter_custom custom_filter;
 };
@@ -340,6 +349,10 @@ struct ndb_filter_field {
 	enum ndb_filter_fieldtype type;
 	enum ndb_generic_element_type elem_type;
 	char tag; // for generic queries like #t
+	// grain fork: set by ndb_filter_end_field on ids/authors when any
+	// element is shorter than a full id. Switches matching from bsearch
+	// to a prefix scan and keeps the exact-seek query plans away.
+	char has_prefix;
 };
 
 struct ndb_filter_elements {
@@ -724,6 +737,11 @@ int ndb_filter_init_with(struct ndb_filter *filter, int pages);
 int ndb_filter_init_for_ids(struct ndb_filter *filter, int num_ids);
 
 int ndb_filter_add_id_element(struct ndb_filter *, const unsigned char *id);
+// grain fork: add a NIP-01 id/author prefix. `id` holds ceil(nibbles/2)
+// significant bytes; for an odd nibble count only the high nibble of the last
+// byte is used. Only valid on ids and authors fields. nibbles must be 1..64;
+// 64 is the same as ndb_filter_add_id_element.
+int ndb_filter_add_id_prefix_element(struct ndb_filter *, const unsigned char *id, int nibbles);
 int ndb_filter_add_int_element(struct ndb_filter *, uint64_t integer);
 int ndb_filter_add_str_element(struct ndb_filter *, const char *str);
 int ndb_filter_add_custom_filter_element(struct ndb_filter *filter, ndb_filter_callback_fn *cb, void *ctx);
@@ -737,6 +755,9 @@ int ndb_filter_from_json(const char *, int len, struct ndb_filter *filter, unsig
 
 // getting field elements
 unsigned char *ndb_filter_get_id_element(const struct ndb_filter *, const struct ndb_filter_elements *, int index);
+// grain fork: significant hex chars of an id/author element, 64 for a full id.
+// Always 64 for tag elements.
+int ndb_filter_get_id_element_nibbles(const struct ndb_filter *, const struct ndb_filter_elements *, int index);
 const char *ndb_filter_get_string_element(const struct ndb_filter *, const struct ndb_filter_elements *, int index);
 uint64_t ndb_filter_get_int_element(const struct ndb_filter_elements *, int index);
 uint64_t *ndb_filter_get_int_element_ptr(struct ndb_filter_elements *, int index);

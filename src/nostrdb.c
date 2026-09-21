@@ -876,6 +876,19 @@ ndb_filter_get_id_element(const struct ndb_filter *filter, const struct ndb_filt
 	return ndb_filter_elements_data(filter, els->elements[index]);
 }
 
+int ndb_filter_get_id_element_nibbles(const struct ndb_filter *filter,
+				      const struct ndb_filter_elements *els,
+				      int index)
+{
+	unsigned char *id;
+
+	if (els->field.type != NDB_FILTER_IDS && els->field.type != NDB_FILTER_AUTHORS)
+		return 64;
+	if (!(id = ndb_filter_elements_data(filter, els->elements[index])))
+		return 64;
+	return id[32];
+}
+
 const char *
 ndb_filter_get_string_element(const struct ndb_filter *filter, const struct ndb_filter_elements *els, int index)
 {
@@ -933,10 +946,12 @@ int ndb_filter_init(struct ndb_filter *filter) {
 	return ndb_filter_init_with(filter, NDB_FILTER_PAGES);
 }
 
-// number of 32-byte ids that fit in one page of a filter's data buffer.
-// ndb_filter_init_with hands 3/4 of each page to the data buffer, and an id
-// element costs 32 bytes there
-#define NDB_FILTER_IDS_PER_PAGE ((NDB_FILTER_PAGE_SIZE * 3 / 4) / 32)
+// number of ids that fit in one page of a filter's data buffer.
+// ndb_filter_init_with hands 3/4 of each page to the data buffer, and an
+// ids/authors element costs 33 bytes there: the id plus its prefix-length
+// byte (grain fork)
+#define NDB_FILTER_ID_ELEMENT_SIZE 33
+#define NDB_FILTER_IDS_PER_PAGE ((NDB_FILTER_PAGE_SIZE * 3 / 4) / NDB_FILTER_ID_ELEMENT_SIZE)
 
 int ndb_filter_init_for_ids(struct ndb_filter *filter, int num_ids)
 {
@@ -1012,6 +1027,7 @@ static int ndb_filter_start_field_impl(struct ndb_filter *filter, enum ndb_filte
 	els->field.type = field;
 	els->field.tag = tag;
 	els->field.elem_type = 0;
+	els->field.has_prefix = 0;
 	els->count = 0;
 
 	return 1;
@@ -1044,7 +1060,12 @@ static int ndb_filter_add_element(struct ndb_filter *filter, union ndb_filter_el
 		break;
 	case NDB_FILTER_IDS:
 	case NDB_FILTER_AUTHORS:
-		if (!cursor_push(&filter->data_buf, (unsigned char *)el.id, 32))
+		// 32 id bytes then the nibble count. Elements address their
+		// data by offset, so the extra byte is invisible to readers
+		// that only want the id.
+		if (!cursor_push(&filter->data_buf, (unsigned char *)el.id_prefix.id, 32))
+			return 0;
+		if (!cursor_push_byte(&filter->data_buf, (unsigned char)el.id_prefix.nibbles))
 			return 0;
 		break;
 	case NDB_FILTER_KINDS:
@@ -1266,10 +1287,64 @@ int ndb_filter_add_id_element(struct ndb_filter *filter, const unsigned char *id
 	if (!ndb_filter_set_elem_type(filter, NDB_ELEMENT_ID))
 		return 0;
 
-	// this is needed so that generic filters know its an id
-	el.id = id;
+	// this is needed so that generic filters know its an id. tags read
+	// el.id; ids/authors read el.id_prefix, which aliases it
+	el.id_prefix.id = id;
+	el.id_prefix.nibbles = 64;
 
 	return ndb_filter_add_element(filter, el);
+}
+
+int ndb_filter_add_id_prefix_element(struct ndb_filter *filter,
+				     const unsigned char *id, int nibbles)
+{
+	union ndb_filter_element el;
+	struct ndb_filter_elements *current;
+	unsigned char padded[32];
+	int bytes;
+
+	if (nibbles < 1 || nibbles > 64)
+		return 0;
+	if (nibbles == 64)
+		return ndb_filter_add_id_element(filter, id);
+
+	if (!(current = ndb_filter_current_element(filter)))
+		return 0;
+
+	// prefixes are a NIP-01 ids/authors thing; tag values match exactly
+	if (current->field.type != NDB_FILTER_IDS &&
+	    current->field.type != NDB_FILTER_AUTHORS)
+		return 0;
+
+	if (!ndb_filter_set_elem_type(filter, NDB_ELEMENT_ID))
+		return 0;
+
+	// zero-pad so the stored 32 bytes double as the low bound of the
+	// prefix's key range, and so sorting by memcmp stays meaningful
+	bytes = (nibbles + 1) / 2;
+	memset(padded, 0, sizeof(padded));
+	memcpy(padded, id, bytes);
+	if (nibbles & 1)
+		padded[bytes - 1] &= 0xF0;
+
+	el.id_prefix.id = padded;
+	el.id_prefix.nibbles = nibbles;
+
+	return ndb_filter_add_element(filter, el);
+}
+
+// grain fork: does `id` start with the first `nibbles` hex chars of `prefix`?
+// `prefix` is the zero-padded 32 byte form stored in the filter.
+static inline int ndb_id_prefix_matches(const unsigned char *id,
+					const unsigned char *prefix, int nibbles)
+{
+	int bytes = nibbles / 2;
+
+	if (bytes && memcmp(id, prefix, bytes))
+		return 0;
+	if (nibbles & 1)
+		return (id[bytes] & 0xF0) == (prefix[bytes] & 0xF0);
+	return 1;
 }
 
 static int ndb_tag_filter_matches(struct ndb_filter *filter,
@@ -1420,6 +1495,25 @@ static int compare_kinds(const void *pa, const void *pb)
 
 //
 // returns 1 if a filter matches a note
+// grain fork: linear prefix match over an ids/authors list that holds at
+// least one prefix. bsearch can't be used because a prefix is equal to every
+// id under it. Lists with prefixes are the "00".."ff" probe shape and small
+// hand-written filters, so a scan is fine.
+static int ndb_filter_id_prefix_scan(const struct ndb_filter *filter,
+				     const struct ndb_filter_elements *els,
+				     const unsigned char *key)
+{
+	int i;
+	const unsigned char *el;
+
+	for (i = 0; i < els->count; i++) {
+		el = ndb_filter_elements_data(filter, els->elements[i]);
+		if (ndb_id_prefix_matches(key, el, el[32]))
+			return 1;
+	}
+	return 0;
+}
+
 static int ndb_filter_matches_with(struct ndb_filter *filter,
 				   struct ndb_note *note, int already_matched,
 				   struct ndb_note_relay_iterator *relay_iter)
@@ -1466,6 +1560,11 @@ static int ndb_filter_matches_with(struct ndb_filter *filter,
 			break;
 		case NDB_FILTER_IDS:
 			state.key = ndb_note_id(note);
+			if (els->field.has_prefix) {
+				if (ndb_filter_id_prefix_scan(filter, els, state.key))
+					continue;
+				break;
+			}
 			if (bsearch(&state, &els->elements[0], els->count,
 				    sizeof(els->elements[0]), search_ids)) {
 				continue;
@@ -1473,6 +1572,11 @@ static int ndb_filter_matches_with(struct ndb_filter *filter,
 			break;
 		case NDB_FILTER_AUTHORS:
 			state.key = ndb_note_pubkey(note);
+			if (els->field.has_prefix) {
+				if (ndb_filter_id_prefix_scan(filter, els, state.key))
+					continue;
+				break;
+			}
 			if (bsearch(&state, &els->elements[0], els->count,
 				    sizeof(els->elements[0]), search_ids)) {
 				continue;
@@ -1489,7 +1593,9 @@ static int ndb_filter_matches_with(struct ndb_filter *filter,
 			break;
 		case NDB_FILTER_UNTIL:
 			assert(els->count == 1);
-			if (note->created_at < els->elements[0])
+			// NIP-01: since <= created_at <= until. The index seeks
+			// were already inclusive; the in-memory match was not
+			if (note->created_at <= els->elements[0])
 				continue;
 			break;
 		case NDB_FILTER_SEARCH:
@@ -1606,6 +1712,9 @@ static int ndb_filter_field_eq(struct ndb_filter *a_filt,
 			b_id = ndb_filter_get_id_element(b_filt, b_field, i);
 			if (memcmp(a_id, b_id, 32))
 				return 0;
+			if (ndb_filter_get_id_element_nibbles(a_filt, a_field, i) !=
+			    ndb_filter_get_id_element_nibbles(b_filt, b_field, i))
+				return 0;
 			break;
 		case NDB_ELEMENT_INT:
 			a_int = ndb_filter_get_int_element(a_field, i);
@@ -1621,7 +1730,7 @@ static int ndb_filter_field_eq(struct ndb_filter *a_filt,
 
 void ndb_filter_end_field(struct ndb_filter *filter)
 {
-	int cur_offset;
+	int cur_offset, i;
 	struct ndb_filter_elements *cur;
 
 	cur_offset = filter->current;
@@ -1636,6 +1745,12 @@ void ndb_filter_end_field(struct ndb_filter *filter)
 	case NDB_FILTER_IDS:
 	case NDB_FILTER_AUTHORS:
 		sort_filter_elements(filter, cur, compare_ids);
+		for (i = 0; i < cur->count; i++) {
+			if (ndb_filter_get_id_element_nibbles(filter, cur, i) < 64) {
+				cur->field.has_prefix = 1;
+				break;
+			}
+		}
 		break;
 	case NDB_FILTER_RELAYS:
 		sort_filter_elements(filter, cur, compare_strs);
@@ -4739,6 +4854,76 @@ static int ndb_query_plan_all_notes(struct ndb_txn *txn, struct ndb_query_state 
 	return 1;
 }
 
+// grain fork: walk every entry of a tsid index (note_id or note_pubkey)
+// whose id starts with `prefix`. The index is keyed {id, created_at} and
+// compared id-first, so the matching entries are one contiguous run that
+// begins at {zero-padded prefix, 0}. Results are in id order rather than
+// created_at order; ndb_query sorts afterwards, but `limit` fills from the
+// low end of the prefix range rather than from the newest note. That is the
+// price of not having a created_at-ordered index over an arbitrary id
+// range, and it's acceptable for the probe-shaped filters that send
+// prefixes. since/until are applied by the full filter match.
+//
+// `cur` is the caller's open cursor on the right db. Returns 0 only when the
+// result set is full, so the caller can stop iterating elements.
+static int ndb_query_plan_scan_id_prefix(struct ndb_txn *txn, MDB_cursor *cur,
+					 struct ndb_filter *filter,
+					 struct ndb_query_state *results,
+					 enum ndb_filter_fieldtype field,
+					 const unsigned char *prefix, int nibbles,
+					 int need_relays)
+{
+	MDB_val k, v;
+	struct ndb_tsid tsid, *ptsid;
+	struct ndb_note *note;
+	struct ndb_query_result res;
+	struct ndb_note_relay_iterator note_relay_iter;
+	struct ndb_note_relay_iterator *relay_iter;
+	uint64_t note_key;
+	size_t note_size;
+	int rc;
+
+	ndb_tsid_init(&tsid, (unsigned char *)prefix, 0);
+	k.mv_data = &tsid;
+	k.mv_size = sizeof(tsid);
+
+	for (rc = mdb_cursor_get(cur, &k, &v, MDB_SET_RANGE);
+	     rc == MDB_SUCCESS;
+	     rc = mdb_cursor_get(cur, &k, &v, MDB_NEXT))
+	{
+		if (query_is_full(results))
+			return 0;
+
+		ptsid = (struct ndb_tsid *)k.mv_data;
+		if (!ndb_id_prefix_matches(ptsid->id, prefix, nibbles))
+			break;
+
+		note_key = *(uint64_t *)v.mv_data;
+		if (!(note = ndb_get_note_by_key(txn, note_key, &note_size)))
+			continue;
+
+		relay_iter = NULL;
+		if (need_relays) {
+			relay_iter = &note_relay_iter;
+			ndb_note_relay_iterate_start(txn, relay_iter, note_key);
+		}
+
+		// this element matched, but the field may hold other
+		// elements and the rest of the filter still applies
+		if (!ndb_filter_matches_with(filter, note, 1 << field, relay_iter)) {
+			ndb_note_relay_iterate_close(relay_iter);
+			continue;
+		}
+		ndb_note_relay_iterate_close(relay_iter);
+
+		ndb_query_result_init(&res, note, note_size, note_key);
+		if (!push_query_result(results, &res))
+			return 0;
+	}
+
+	return 1;
+}
+
 static int ndb_query_plan_execute_ids(struct ndb_txn *txn,
 				      struct ndb_filter *filter,
 				      struct ndb_query_state *results)
@@ -4754,6 +4939,7 @@ static int ndb_query_plan_execute_ids(struct ndb_txn *txn,
 	uint64_t note_id, until, *pint;
 	size_t note_size;
 	unsigned char *id;
+	int nibbles;
 	struct ndb_note_relay_iterator note_relay_iter = {0};
 	struct ndb_note_relay_iterator *relay_iter = NULL;
 
@@ -4778,6 +4964,16 @@ static int ndb_query_plan_execute_ids(struct ndb_txn *txn,
 			break;
 
 		id = ndb_filter_get_id_element(filter, ids, i);
+		nibbles = ndb_filter_get_id_element_nibbles(filter, ids, i);
+
+		if (nibbles < 64) {
+			if (!ndb_query_plan_scan_id_prefix(txn, cur, filter, results,
+							   NDB_FILTER_IDS, id, nibbles,
+							   need_relays))
+				break;
+			continue;
+		}
+
 		ndb_tsid_init(&tsid, (unsigned char *)id, until);
 
 		k.mv_data = &tsid;
@@ -4863,7 +5059,7 @@ static int ndb_query_plan_execute_authors(struct ndb_txn *txn,
 {
 	MDB_val k, v;
 	MDB_cursor *cur;
-	int rc, i, need_relays = 0;
+	int rc, i, need_relays = 0, nibbles;
 	uint64_t *pint, until, since, note_key;
 	unsigned char *author;
 	struct ndb_note *note;
@@ -4895,6 +5091,15 @@ static int ndb_query_plan_execute_authors(struct ndb_txn *txn,
 
 	for (i = 0; i < authors->count; i++) {
 		author = ndb_filter_get_id_element(filter, authors, i);
+		nibbles = ndb_filter_get_id_element_nibbles(filter, authors, i);
+
+		if (nibbles < 64) {
+			if (!ndb_query_plan_scan_id_prefix(txn, cur, filter, results,
+							   NDB_FILTER_AUTHORS, author,
+							   nibbles, need_relays))
+				break;
+			continue;
+		}
 
 		ndb_tsid_init(&tsid, author, until);
 
@@ -5749,13 +5954,15 @@ static enum ndb_query_plan ndb_filter_plan(struct ndb_filter *filter)
 		return NDB_PLAN_IDS;
 	} else if (relays && kinds && !authors) {
 		return NDB_PLAN_RELAY_KINDS;
-	} else if (kinds && authors &&
+	} else if (kinds && authors && !authors->field.has_prefix &&
 		   (authors->count == 1 ||
 		    authors->count * kinds->count <= NDB_MAX_AUTHOR_KIND_SCANNERS)) {
 		// the plan itself has always been multi-author (it merges every
-		// author*kind run); only the scanner count needs bounding
+		// author*kind run); only the scanner count needs bounding.
+		// author_kinds seeks exact pubkeys, so a prefix list goes to
+		// the authors plan, which can range-scan
 		return NDB_PLAN_AUTHOR_KINDS;
-	} else if (authors && authors->count == 1) {
+	} else if (authors && (authors->count == 1 || authors->field.has_prefix)) {
 		return NDB_PLAN_AUTHORS;
 	} else if (tags && tags->count == 1) {
 		return NDB_PLAN_TAGS;
@@ -9976,6 +10183,27 @@ static int cursor_push_escaped_char(struct cursor *cur, char c)
         return cursor_push_byte(cur, c);
 }
 
+// grain fork: like cursor_push_hex_str but emits exactly `nibbles` hex chars,
+// so a stored prefix round-trips as the prefix the client sent
+static int cursor_push_hex_prefix_str(struct cursor *cur, unsigned char *buf, int nibbles)
+{
+	int i;
+
+	if (nibbles < 1 || nibbles > 64)
+		return 0;
+
+	if (!cursor_push_byte(cur, '"'))
+		return 0;
+
+	for (i = 0; i < nibbles; i++) {
+		unsigned int c = buf[i / 2];
+		if (!cursor_push_byte(cur, hexchar((i & 1) ? (c & 0xF) : (c >> 4))))
+			return 0;
+	}
+
+	return cursor_push_byte(cur, '"');
+}
+
 static int cursor_push_hex_str(struct cursor *cur, unsigned char *buf, int len)
 {
 	int i;
@@ -10186,7 +10414,8 @@ static int cursor_push_json_elem_array(struct cursor *cur,
 			break;
 		case NDB_ELEMENT_ID:
 			id = ndb_filter_get_id_element(filter, elems, i);
-			if (!cursor_push_hex_str(cur, id, 32))
+			if (!cursor_push_hex_prefix_str(cur, id,
+					ndb_filter_get_id_element_nibbles(filter, elems, i)))
 				return 0;
 			break;
 		case NDB_ELEMENT_INT:
@@ -10895,6 +11124,7 @@ static int ndb_filter_parse_json_ids(struct ndb_json_parser *parser,
 	jsmntok_t *tok;
 	const char *start;
 	unsigned char hexbuf[32];
+	char hexstr[65];
 	int tok_len, i, size;
 
 	tok = &parser->toks[parser->i++];
@@ -10916,19 +11146,23 @@ static int ndb_filter_parse_json_ids(struct ndb_json_parser *parser,
 			return 0;
 		}
 
-		if (tok_len != 64) {
-			ndb_debug("parse_json_ids: not len 64: '%.*s'\n", tok_len, start);
+		// NIP-01: an exact 64-char id, or any prefix of one
+		if (tok_len < 1 || tok_len > 64) {
+			ndb_debug("parse_json_ids: bad length %d: '%.*s'\n", tok_len, tok_len, start);
 			return 0;
 		}
 
-		// id
-		if (!hex_decode(start, tok_len, hexbuf, sizeof(hexbuf))) {
+		// hex_decode wants whole bytes; pad an odd prefix with a 0
+		// nibble, which ndb_filter_add_id_prefix_element masks off
+		memcpy(hexstr, start, tok_len);
+		hexstr[tok_len] = '0';
+		if (!hex_decode(hexstr, (tok_len + 1) & ~1, hexbuf, (tok_len + 1) / 2)) {
 			ndb_debug("parse_json_ids: hex decode failed\n");
 			return 0;
 		}
 
-		ndb_debug("adding id elem\n");
-		if (!ndb_filter_add_id_element(filter, hexbuf)) {
+		ndb_debug("adding id elem (%d nibbles)\n", tok_len);
+		if (!ndb_filter_add_id_prefix_element(filter, hexbuf, tok_len)) {
 			ndb_debug("parse_json_ids: failed to add id element\n");
 			return 0;
 		}

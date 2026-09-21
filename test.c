@@ -4186,6 +4186,198 @@ static void test_configurable_fulltext_kinds()
 	printf("ok test_configurable_fulltext_kinds\n");
 }
 
+// grain fork: NIP-01 lets `ids` and `authors` be hex prefixes. Four notes
+// whose ids and pubkeys share chosen prefixes, then queries by exact id,
+// even prefix, odd prefix, mixed full+prefix lists, and prefix authors
+// combined with kinds (which must not take the exact-seek author_kinds
+// plan). Also checks the in-memory matcher (subscriptions) and that a
+// prefix survives a JSON round trip as the prefix, not a padded id.
+static void test_id_author_prefix_filters()
+{
+	struct ndb *ndb;
+	struct ndb_txn txn;
+	struct ndb_config config;
+	struct ndb_filter filter, *f = &filter;
+	struct ndb_filter sub, *sf = &sub;
+	struct ndb_query_result results[8];
+	static unsigned char buf[16384]; // jsmn token scratch; the probe has 260 tokens
+	char json_out[1024];
+	uint64_t note_keys[4], subid;
+	int count, i;
+
+#define PFX_PK_A "aa11" "000000000000000000000000000000000000000000000000000000000000"
+#define PFX_PK_B "aa12" "000000000000000000000000000000000000000000000000000000000000"
+#define PFX_PK_C "ab00" "000000000000000000000000000000000000000000000000000000000000"
+#define PFX_ID_1 "c0de" "000000000000000000000000000000000000000000000000000000000001"
+#define PFX_ID_2 "c0df" "000000000000000000000000000000000000000000000000000000000002"
+#define PFX_ID_3 "c1de" "000000000000000000000000000000000000000000000000000000000003"
+#define PFX_ID_4 "ffff" "000000000000000000000000000000000000000000000000000000000004"
+#define PFX_SIG "ae1218280f554ea0b04ae09921031493d60fb7831dfd2dbd7086efeace2719a46842ce80342ebc002da8943df02e98b8b4abb4629c7103ca2114e6c4425f97fe"
+#define PFX_NOTE(id, pk, kind, ts) \
+	"[\"EVENT\",{\"id\":\"" id "\",\"pubkey\":\"" pk "\",\"created_at\":" #ts \
+	",\"kind\":" #kind ",\"tags\":[],\"content\":\"prefix test\",\"sig\":\"" PFX_SIG "\"}]"
+
+	static const char *notes[] = {
+		PFX_NOTE(PFX_ID_1, PFX_PK_A, 1, 1742498400),
+		PFX_NOTE(PFX_ID_2, PFX_PK_B, 1, 1742498401),
+		PFX_NOTE(PFX_ID_3, PFX_PK_C, 7, 1742498402),
+		PFX_NOTE(PFX_ID_4, PFX_PK_C, 1, 1742498403),
+	};
+
+	delete_test_db();
+	ndb_default_config(&config);
+	ndb_config_set_flags(&config, NDB_FLAG_SKIP_NOTE_VERIFY);
+	assert(ndb_init(&ndb, test_dir, &config));
+
+	// subscribe with an odd-length author prefix so the matcher path is
+	// exercised by the writer's notify, not just the query planner
+	assert(ndb_filter_init(sf));
+	assert(ndb_filter_start_field(sf, NDB_FILTER_AUTHORS));
+	{
+		unsigned char pk_prefix[2] = { 0xaa, 0x10 }; // "aa1" -> aa, then high nibble 1
+		assert(ndb_filter_add_id_prefix_element(sf, pk_prefix, 3));
+		assert(sf->elem_buf.start);
+	}
+	ndb_filter_end_field(sf);
+	assert(ndb_filter_end(sf));
+	assert((subid = ndb_subscribe(ndb, sf, 1)));
+
+	for (i = 0; i < 4; i++)
+		assert(ndb_process_client_event(ndb, notes[i], strlen(notes[i])));
+
+	// "aa1" matches PK_A and PK_B only. the two can land in separate
+	// writer batches, so collect until both have been delivered
+	{
+		int got = 0;
+		while (got < 2)
+			got += ndb_wait_for_notes(ndb, subid, note_keys + got, 2 - got);
+		assert(got == 2);
+	}
+
+	// the third and fourth notes go through the same writer batch or a
+	// later one; either way wait until all four are queryable
+	{
+		int attempts;
+		unsigned char id[32];
+		assert(hex_decode(PFX_ID_4, 64, id, 32));
+		for (attempts = 0; attempts < 100; attempts++) {
+			uint64_t k;
+			assert(ndb_begin_query(ndb, &txn));
+			k = ndb_get_notekey_by_id(&txn, id);
+			ndb_end_query(&txn);
+			if (k) break;
+			usleep(10000);
+		}
+		assert(attempts < 100);
+	}
+
+	// all four are committed now, and the prefix subscription must not
+	// have fired for PK_C ("ab00...")
+	assert(ndb_poll_for_notes(ndb, subid, note_keys + 2, 2) == 0);
+
+	assert(ndb_begin_query(ndb, &txn));
+
+#define PFX_QUERY(js, expect) do { \
+	assert(ndb_filter_init(f)); \
+	assert(ndb_filter_from_json(js, strlen(js), f, buf, sizeof(buf))); \
+	count = -1; \
+	assert(ndb_query(&txn, f, 1, results, ARRAY_SIZE(results), &count)); \
+	if (count != (expect)) { \
+		fprintf(stderr, "prefix query %s: got %d, want %d\n", js, count, (expect)); \
+		assert(0); \
+	} \
+	ndb_filter_destroy(f); \
+} while (0)
+
+	// ids: exact, even prefix, odd prefix, a prefix matching nothing,
+	// and a list mixing a full id with a prefix
+	PFX_QUERY("{\"ids\":[\"" PFX_ID_1 "\"]}", 1);
+	PFX_QUERY("{\"ids\":[\"c0\"]}", 2);
+	PFX_QUERY("{\"ids\":[\"c0d\"]}", 2);
+	PFX_QUERY("{\"ids\":[\"c0de\"]}", 1);
+	PFX_QUERY("{\"ids\":[\"c\"]}", 3);
+	PFX_QUERY("{\"ids\":[\"d\"]}", 0);
+	PFX_QUERY("{\"ids\":[\"ffff\",\"" PFX_ID_1 "\"]}", 2);
+
+	// authors: same shapes, plus the kinds combination
+	PFX_QUERY("{\"authors\":[\"aa\"]}", 2);
+	PFX_QUERY("{\"authors\":[\"a\"]}", 4);
+	PFX_QUERY("{\"authors\":[\"aa1\"]}", 2);
+	PFX_QUERY("{\"authors\":[\"ab\"]}", 2);
+	PFX_QUERY("{\"authors\":[\"ab\"],\"kinds\":[1]}", 1);
+	PFX_QUERY("{\"authors\":[\"ab\"],\"kinds\":[7]}", 1);
+	PFX_QUERY("{\"authors\":[\"a\"],\"kinds\":[1],\"limit\":2}", 2);
+	PFX_QUERY("{\"authors\":[\"aa\",\"" PFX_PK_C "\"],\"kinds\":[1]}", 3);
+	PFX_QUERY("{\"authors\":[\"b\"]}", 0);
+
+	// since/until still apply on top of a prefix scan
+	PFX_QUERY("{\"authors\":[\"a\"],\"since\":1742498402}", 2);
+	PFX_QUERY("{\"ids\":[\"c\"],\"until\":1742498400}", 1);
+
+	// the production probe shape: every two-char prefix
+	{
+		static char probe[4096];
+		int n = 0, h;
+		n += sprintf(probe + n, "{\"authors\":[");
+		for (h = 0; h < 256; h++)
+			n += sprintf(probe + n, "%s\"%02x\"", h ? "," : "", h);
+		n += sprintf(probe + n, "],\"kinds\":[1],\"limit\":8}");
+		PFX_QUERY(probe, 3);
+	}
+
+	ndb_end_query(&txn);
+
+	// a prefix round-trips through ndb_filter_json as the prefix
+	assert(ndb_filter_init(f));
+	{
+		const char *js = "{\"ids\":[\"c0d\",\"" PFX_ID_1 "\"],\"authors\":[\"ab\"]}";
+		assert(ndb_filter_from_json(js, strlen(js), f, buf, sizeof(buf)));
+	}
+	assert(ndb_filter_json(f, json_out, sizeof(json_out)));
+	assert(strstr(json_out, "\"c0d\""));
+	assert(strstr(json_out, "\"" PFX_ID_1 "\""));
+	assert(strstr(json_out, "\"ab\""));
+	assert(!strstr(json_out, "\"c0d0"));
+
+	// and equality is prefix-length aware: "c0d" != "c0d0"
+	{
+		struct ndb_filter other, *of = &other;
+		const char *js = "{\"ids\":[\"c0d0\",\"" PFX_ID_1 "\"],\"authors\":[\"ab\"]}";
+		assert(ndb_filter_init(of));
+		assert(ndb_filter_from_json(js, strlen(js), of, buf, sizeof(buf)));
+		assert(!ndb_filter_eq(f, of));
+		ndb_filter_destroy(of);
+	}
+	ndb_filter_destroy(f);
+
+	// tags never take prefixes, and out-of-range lengths are rejected
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_TAGS));
+	{
+		unsigned char b[1] = { 0xaa };
+		assert(!ndb_filter_add_id_prefix_element(f, b, 2));
+	}
+	ndb_filter_end_field(f);
+	ndb_filter_destroy(f);
+	assert(ndb_filter_init(f));
+	{
+		const char *js = "{\"ids\":[\"\"]}";
+		assert(!ndb_filter_from_json(js, strlen(js), f, buf, sizeof(buf)));
+	}
+	ndb_filter_destroy(f);
+	assert(ndb_filter_init(f));
+	{
+		const char *js = "{\"ids\":[\"" PFX_ID_1 "0\"]}";
+		assert(!ndb_filter_from_json(js, strlen(js), f, buf, sizeof(buf)));
+	}
+	ndb_filter_destroy(f);
+
+	ndb_filter_destroy(sf);
+	ndb_destroy(ndb);
+
+	printf("ok test_id_author_prefix_filters\n");
+}
+
 int main(int argc, const char *argv[]) {
 	delete_test_db();
 
@@ -4210,6 +4402,7 @@ int main(int argc, const char *argv[]) {
 	test_note_relay_index();
 	test_delete_note_clears_indexes();
 	test_configurable_fulltext_kinds();
+	test_id_author_prefix_filters();
 	test_filter_search();
 	test_filter_parse_search_json();
 	test_parse_filter_json();
