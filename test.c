@@ -4088,6 +4088,104 @@ static void test_delete_note_clears_indexes()
 	printf("ok test_delete_note_clears_indexes\n");
 }
 
+// grain fork: the fulltext kind set is configurable. A kind-7 reaction is
+// never indexed by default; opt it in and the same content becomes
+// searchable. Also proves the delete path consults the same set: the
+// opted-in note's text rows go away with it.
+static void test_configurable_fulltext_kinds()
+{
+	struct ndb *ndb;
+	struct ndb_txn txn;
+	struct ndb_config config;
+	struct ndb_text_search_config search_config;
+	struct ndb_text_search_results results;
+	struct ndb_filter filter, *f = &filter;
+	struct ndb_stat before, after;
+	uint64_t note_key, subid;
+	unsigned char id[32];
+	int attempts;
+	static const uint64_t kinds[] = { 1, 30023, 7 };
+
+	const char *json = "[\"EVENT\",{"
+		"\"id\":\"4b1e9d2c7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d\","
+		"\"pubkey\":\"55c882cf4a255ac66fc8507e718a1d1283ba46eb7d678d0573184dada1a4f376\","
+		"\"created_at\":1742498340,\"kind\":7,"
+		"\"tags\":[[\"e\",\"0f20295584a62d983a4fa85f7e50b460cd0049f94d8cd250b864bb822a747114\"]],"
+		"\"content\":\"zebra quokka platypus\","
+		"\"sig\":\"ae1218280f554ea0b04ae09921031493d60fb7831dfd2dbd7086efeace2719a46842ce80342ebc002da8943df02e98b8b4abb4629c7103ca2114e6c4425f97fe\"}]";
+
+	ndb_default_text_search_config(&search_config);
+
+	assert(ndb_filter_init(f));
+	assert(ndb_filter_start_field(f, NDB_FILTER_KINDS));
+	assert(ndb_filter_add_int_element(f, 7));
+	ndb_filter_end_field(f);
+	ndb_filter_end(f);
+
+	// 1) default set: kind 7 content is not indexed
+	delete_test_db();
+	ndb_default_config(&config);
+	ndb_config_set_flags(&config, NDB_FLAG_SKIP_NOTE_VERIFY);
+	assert(ndb_init(&ndb, test_dir, &config));
+	assert((subid = ndb_subscribe(ndb, f, 1)));
+	assert(ndb_process_client_event(ndb, json, strlen(json)));
+	assert(ndb_wait_for_notes(ndb, subid, &note_key, 1) == 1);
+
+	assert(ndb_begin_query(ndb, &txn));
+	assert(ndb_text_search(&txn, "quokka", &results, &search_config));
+	assert(results.num_results == 0);
+	ndb_end_query(&txn);
+	ndb_destroy(ndb);
+
+	// 2) opted in: same note, same content, now searchable
+	delete_test_db();
+	ndb_default_config(&config);
+	ndb_config_set_flags(&config, NDB_FLAG_SKIP_NOTE_VERIFY);
+	assert(ndb_config_set_fulltext_kinds(&config, kinds, 3));
+	assert(!ndb_config_set_fulltext_kinds(&config, kinds, NDB_MAX_FULLTEXT_KINDS + 1));
+	assert(ndb_init(&ndb, test_dir, &config));
+	assert(ndb_stat(ndb, &before));
+	assert((subid = ndb_subscribe(ndb, f, 1)));
+	assert(ndb_process_client_event(ndb, json, strlen(json)));
+	assert(ndb_wait_for_notes(ndb, subid, &note_key, 1) == 1);
+
+	assert(ndb_begin_query(ndb, &txn));
+	assert(ndb_text_search(&txn, "quokka", &results, &search_config));
+	assert(results.num_results == 1);
+	assert(results.results[0].key.note_id == note_key);
+	ndb_end_query(&txn);
+
+	assert(ndb_stat(ndb, &after));
+	assert(after.dbs[NDB_DB_NOTE_TEXT].count == before.dbs[NDB_DB_NOTE_TEXT].count + 3);
+	// a kind 7 is not a text-shaped note: no blocks row even when indexed
+	assert(after.dbs[NDB_DB_NOTE_BLOCKS].count == before.dbs[NDB_DB_NOTE_BLOCKS].count);
+
+	// 3) delete consults the same set
+	assert(hex_decode("4b1e9d2c7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a8f7e6d5c4b3a2f1e0d", 64, id, 32));
+	assert(ndb_request_delete_note(ndb, id));
+	for (attempts = 0; attempts < 100; attempts++) {
+		uint64_t k;
+		assert(ndb_begin_query(ndb, &txn));
+		k = ndb_get_notekey_by_id(&txn, id);
+		ndb_end_query(&txn);
+		if (k == 0) break;
+		usleep(10000);
+	}
+	assert(attempts < 100);
+	assert(ndb_stat(ndb, &after));
+	assert(after.dbs[NDB_DB_NOTE_TEXT].count == before.dbs[NDB_DB_NOTE_TEXT].count);
+
+	assert(ndb_begin_query(ndb, &txn));
+	assert(ndb_text_search(&txn, "quokka", &results, &search_config));
+	assert(results.num_results == 0);
+	ndb_end_query(&txn);
+
+	ndb_filter_destroy(f);
+	ndb_destroy(ndb);
+
+	printf("ok test_configurable_fulltext_kinds\n");
+}
+
 int main(int argc, const char *argv[]) {
 	delete_test_db();
 
@@ -4111,6 +4209,7 @@ int main(int argc, const char *argv[]) {
 	test_reaction_counter();
 	test_note_relay_index();
 	test_delete_note_clears_indexes();
+	test_configurable_fulltext_kinds();
 	test_filter_search();
 	test_filter_parse_search_json();
 	test_parse_filter_json();

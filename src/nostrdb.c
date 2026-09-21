@@ -283,6 +283,10 @@ struct ndb_json_parser {
 struct ndb_lmdb {
 	MDB_env *env;
 	MDB_dbi dbs[NDB_DBS];
+	// grain fork: which kinds carry rows in NDB_DB_NOTE_TEXT. Lives here
+	// because every txn reaches its lmdb, so the writer and the delete
+	// path read the same set.
+	struct ndb_fulltext_kinds fulltext_kinds;
 };
 
 /**
@@ -7026,10 +7030,23 @@ static int handle_reprocessed_giftwrap(
 	return ndb_writer_queue_msg(writer_inbox, &msg);
 }
 
-// Kinds whose content is tokenized into NDB_DB_NOTE_TEXT (and parsed into
-// NDB_DB_NOTE_BLOCKS). Shared by the write path and the grain delete path so
-// the two can never disagree about which notes carry fulltext rows.
-static inline int ndb_kind_is_fulltext(uint64_t kind)
+// Kinds whose content is tokenized into NDB_DB_NOTE_TEXT. Shared by the write
+// path and the grain delete path so the two can never disagree about which
+// notes carry fulltext rows. The set is configurable (ndb_config_set_fulltext_kinds).
+static inline int ndb_kind_is_fulltext(const struct ndb_lmdb *lmdb, uint64_t kind)
+{
+	int i;
+	for (i = 0; i < lmdb->fulltext_kinds.count; i++) {
+		if (lmdb->fulltext_kinds.kinds[i] == kind)
+			return 1;
+	}
+	return 0;
+}
+
+// Kinds that get parsed into NDB_DB_NOTE_BLOCKS and feed the reply / quote
+// counters. These are rendering caches for text-shaped notes and are not
+// widened by the fulltext kind set.
+static inline int ndb_kind_has_blocks(uint64_t kind)
 {
 	return kind == 1 || kind == 30023;
 }
@@ -7117,13 +7134,17 @@ static uint64_t ndb_write_note(secp256k1_context *secp,
 	if (ndb_relay_kind_key_init(&relay_key, note_key, kind, ndb_note_created_at(note->note), note->relay))
 		ndb_write_note_relay_indexes(txn, &relay_key);
 
-	// only parse content and do fulltext index on text and longform notes
-	if (ndb_kind_is_fulltext(kind)) {
-		if (!ndb_flag_set(ndb_flags, NDB_FLAG_NO_FULLTEXT)) {
-			if (!ndb_write_note_fulltext_index(txn, note->note, note_key))
-				return 0;
-		}
+	// fulltext index the kinds the operator asked for (default: text and
+	// longform notes)
+	if (ndb_kind_is_fulltext(txn->lmdb, kind) &&
+	    !ndb_flag_set(ndb_flags, NDB_FLAG_NO_FULLTEXT)) {
+		if (!ndb_write_note_fulltext_index(txn, note->note, note_key))
+			return 0;
+	}
 
+	// only parse content into blocks and count replies on text and
+	// longform notes
+	if (ndb_kind_has_blocks(kind)) {
 		// write note blocks
 		if (!ndb_flag_set(ndb_flags, NDB_FLAG_NO_NOTE_BLOCKS)) {
 			ndb_write_new_blocks(txn, note->note, note_key, scratch, scratch_size);
@@ -7935,7 +7956,8 @@ static int ndb_run_migrations(struct ndb_txn *txn)
 //   - NDB_DB_NOTE_TEXT          (re-tokenize the content with the same word
 //                                parser the write side used and mdb_del each
 //                                key; only for ndb_kind_is_fulltext kinds)
-//   - NDB_DB_NOTE_BLOCKS        (direct mdb_del by note_key)
+//   - NDB_DB_NOTE_BLOCKS        (direct mdb_del by note_key; only for
+//                                ndb_kind_has_blocks kinds)
 //   - NDB_DB_NOTE_ID            (direct mdb_del, dup-value)
 //   - NDB_DB_NOTE               (primary, direct mdb_del by note_key, last)
 //
@@ -8193,10 +8215,13 @@ static int ndb_delete_note_by_id(struct ndb_txn *txn, const unsigned char *id)
 
 	// 9. NDB_DB_NOTE_TEXT and NDB_DB_NOTE_BLOCKS, only for kinds the write
 	//    side indexes. Deleting an absent row (NDB_FLAG_NO_FULLTEXT /
-	//    NDB_FLAG_NO_NOTE_BLOCKS at write time) is a harmless NOTFOUND.
-	if (ndb_kind_is_fulltext(kind)) {
+	//    NDB_FLAG_NO_NOTE_BLOCKS at write time, or a kind that was added
+	//    to the fulltext set after this note was written) is a harmless
+	//    NOTFOUND.
+	if (ndb_kind_is_fulltext(txn->lmdb, kind))
 		ndb_delete_note_fulltext(txn, note, note_key);
 
+	if (ndb_kind_has_blocks(kind)) {
 		k.mv_data = &note_key;
 		k.mv_size = sizeof(note_key);
 		rc = mdb_del(txn->mdb_txn,
@@ -9263,6 +9288,8 @@ int ndb_init(struct ndb **pndb, const char *filename, const struct ndb_config *c
 	if (!ndb_init_lmdb(filename, &ndb->lmdb, config->mapsize))
 		return 0;
 
+	ndb->lmdb.fulltext_kinds = config->fulltext_kinds;
+
 	ndb_monitor_init(&ndb->monitor, config->sub_cb, config->sub_cb_ctx);
 
 	if (!ndb_writer_init(&ndb->writer, &ndb->lmdb, &ndb->monitor, ndb->flags,
@@ -9406,6 +9433,8 @@ int ndb_prune(struct ndb *ndb, const char *output_path,
 		free(scratch);
 		return 0;
 	}
+	// the pruned copy indexes the same kinds as its source
+	dst_lmdb.fulltext_kinds = ndb->lmdb.fulltext_kinds;
 
 	// open read txn on source
 	if ((rc = mdb_txn_begin(ndb->lmdb.env, NULL, MDB_RDONLY, &src_mdb_txn))) {
@@ -11434,6 +11463,19 @@ void ndb_default_config(struct ndb_config *config)
 	config->sub_cb_ctx = NULL;
 	config->sub_cb = NULL;
 	config->writer_scratch_buffer_size = DEFAULT_WRITER_SCRATCH_SIZE;
+	config->fulltext_kinds.kinds[0] = 1;
+	config->fulltext_kinds.kinds[1] = 30023;
+	config->fulltext_kinds.count = 2;
+}
+
+int ndb_config_set_fulltext_kinds(struct ndb_config *config, const uint64_t *kinds, int num_kinds)
+{
+	if (num_kinds < 0 || num_kinds > NDB_MAX_FULLTEXT_KINDS)
+		return 0;
+	if (num_kinds > 0)
+		memcpy(config->fulltext_kinds.kinds, kinds, sizeof(*kinds) * num_kinds);
+	config->fulltext_kinds.count = num_kinds;
+	return 1;
 }
 
 void ndb_config_set_subscription_callback(struct ndb_config *config, ndb_sub_fn fn, void *context)

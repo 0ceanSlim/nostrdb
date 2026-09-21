@@ -365,6 +365,16 @@ struct ndb_filter {
 	int elements[NDB_NUM_FILTERS]; 
 };
 
+// grain fork: the set of kinds whose content is tokenized into the fulltext
+// index. Small and fixed-size so it can live inside the lmdb handle and be
+// consulted on both the write and delete paths without plumbing.
+#define NDB_MAX_FULLTEXT_KINDS 64
+
+struct ndb_fulltext_kinds {
+	uint64_t kinds[NDB_MAX_FULLTEXT_KINDS];
+	int count;
+};
+
 struct ndb_config {
 	int flags;
 	int ingester_threads;
@@ -374,6 +384,7 @@ struct ndb_config {
 	ndb_ingest_filter_fn ingest_filter;
 	void *sub_cb_ctx;
 	ndb_sub_fn sub_cb;
+	struct ndb_fulltext_kinds fulltext_kinds;
 };
 
 struct ndb_text_search_config {
@@ -573,6 +584,10 @@ struct ndb_query_state {
 void ndb_default_config(struct ndb_config *);
 void ndb_config_set_ingest_threads(struct ndb_config *config, int threads);
 void ndb_config_set_flags(struct ndb_config *config, int flags);
+// grain fork: override the kinds that get a fulltext index (default: 1 and
+// 30023). Only affects notes written after open; existing rows are neither
+// added nor removed. Returns 0 if num_kinds exceeds NDB_MAX_FULLTEXT_KINDS.
+int ndb_config_set_fulltext_kinds(struct ndb_config *config, const uint64_t *kinds, int num_kinds);
 void ndb_config_set_mapsize(struct ndb_config *config, size_t mapsize);
 void ndb_config_set_ingest_filter(struct ndb_config *config, ndb_ingest_filter_fn fn, void *);
 void ndb_config_set_subscription_callback(struct ndb_config *config, ndb_sub_fn fn, void *ctx);
