@@ -3598,6 +3598,19 @@ static void ndb_ingester_free_event_data(char *json, const char *relay)
 		free((void *)relay);
 }
 
+// The inbox of the ingester thread we are currently running on, or NULL on
+// any other thread. An ingester that re-ingests work (a kind-6 repost's inner
+// note) queues it here rather than round-robin across the pool: its quit path
+// only knows how to drain its own inbox, so handing work to a sibling that
+// may already have found its inbox empty and exited strands the event in a
+// queue that is about to be freed.
+#if defined(_MSC_VER)
+#define NDB_THREAD_LOCAL __declspec(thread)
+#else
+#define NDB_THREAD_LOCAL _Thread_local
+#endif
+static NDB_THREAD_LOCAL struct prot_queue *ndb_ingester_self_inbox;
+
 static int ndb_ingester_queue_event(struct ndb_ingester *ingester,
 				    char *json, unsigned len,
 				    unsigned client, const char *relay)
@@ -3609,6 +3622,9 @@ static int ndb_ingester_queue_event(struct ndb_ingester *ingester,
 	msg.event.len = len;
 	msg.event.client = client;
 	msg.event.relay = relay;
+
+	if (ndb_ingester_self_inbox)
+		return prot_queue_push(ndb_ingester_self_inbox, &msg);
 
 	return threadpool_dispatch(&ingester->tp, &msg);
 }
@@ -8992,6 +9008,9 @@ static void *ndb_ingester_thread(void *data)
 	ctx = secp256k1_context_create(SECP256K1_CONTEXT_VERIFY);
 	//ndb_debug("started ingester thread\n");
 
+	// re-ingested events stay on this thread; see ndb_ingester_self_inbox
+	ndb_ingester_self_inbox = &thread->inbox;
+
 	done = 0;
 	quitting = 0;
 	while (!done) {
@@ -9123,6 +9142,7 @@ static void *ndb_ingester_thread(void *data)
 	}
 
 	ndb_debug("quitting ingester thread\n");
+	ndb_ingester_self_inbox = NULL;
 	secp256k1_context_destroy(ctx);
 	free(scratch);
 	free(keys);
