@@ -10198,7 +10198,17 @@ static int cursor_push_escaped_char(struct cursor *cur, char c)
         case '\n': return cursor_push_str(cur, "\\n");
         case '\r': return cursor_push_str(cur, "\\r");
         case '\t': return cursor_push_str(cur, "\\t");
-        // TODO: \u hex hex hex hex
+        }
+        // grain fork: the other control characters as lowercase \u00XX,
+        // which is how JSON.stringify (nostr-tools), go-nostr and
+        // rust-nostr serialize them for the id. Written raw, the id
+        // computed here disagrees with the one the client signed.
+        if ((unsigned char)c < 0x20) {
+                static const char hexdig[] = "0123456789abcdef";
+                char esc[6] = { '\\', 'u', '0', '0',
+                                hexdig[((unsigned char)c >> 4) & 0xf],
+                                hexdig[(unsigned char)c & 0xf] };
+                return cursor_push(cur, (unsigned char *)esc, sizeof(esc));
         }
         return cursor_push_byte(cur, c);
 }
@@ -10756,6 +10766,21 @@ static union ndb_packed_str ndb_char_to_packed_str(char c)
 
 
 /// Check for small strings to pack
+// grain fork: only lowercase hex is packed into a 32-byte id. hex_decode
+// takes uppercase too, but a packed id is written back out lowercase, so an
+// uppercase tag value came back changed and the note's id no longer verified.
+static inline int is_lowercase_hex(const char *str, int len)
+{
+	int i;
+
+	for (i = 0; i < len; i++) {
+		if (!((str[i] >= '0' && str[i] <= '9') ||
+		      (str[i] >= 'a' && str[i] <= 'f')))
+			return 0;
+	}
+	return 1;
+}
+
 static inline int ndb_builder_try_compact_str(struct ndb_builder *builder,
 					      const char *str, int len,
 					      union ndb_packed_str *pstr,
@@ -10772,7 +10797,8 @@ static inline int ndb_builder_try_compact_str(struct ndb_builder *builder,
 	} else if (len == 2) {
 		*pstr = ndb_chars_to_packed_str(str[0], str[1]);
 		return 1;
-	} else if (pack_ids && len == 64 && hex_decode(str, 64, id_buf, 32)) {
+	} else if (pack_ids && len == 64 && is_lowercase_hex(str, 64) &&
+		   hex_decode(str, 64, id_buf, 32)) {
 		return ndb_builder_push_packed_id(builder, id_buf, pstr);
 	}
 
