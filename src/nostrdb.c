@@ -11446,6 +11446,15 @@ int ndb_parse_json_note_custom(struct ndb_json_parser *parser,
 
 	for (i = parser->i + 1; i < parser->num_tokens; i++) {
 		tok = &parser->toks[i];
+
+		// grain fork: only the event object's own keys. Skipping
+		// tok->size after "tags" counts the tags, not the strings
+		// inside them, so a tag string such as "pubkey", "content" or
+		// "kind" was read as a top-level key and overwrote that field
+		// of the note, and its recomputed id no longer matched.
+		if (tok->parent != parser->i)
+			continue;
+
 		start = json + tok->start;
 		tok_len = toksize(tok);
 
