@@ -23,6 +23,9 @@
 #define NDB_FLAG_NO_FULLTEXT      (1 << 2)
 #define NDB_FLAG_NO_NOTE_BLOCKS   (1 << 3)
 #define NDB_FLAG_NO_STATS         (1 << 4)
+// grain fork: don't ingest the note embedded in a kind-6 repost's content.
+// A client cache wants it; a relay must store only what was published to it.
+#define NDB_FLAG_NO_REPOST_INGEST (1 << 5)
 
 //#define DEBUG 1
 
@@ -667,6 +670,16 @@ int ndb_process_event(struct ndb *, const char *json, int len);
 // is applied in FIFO order with ingests on the writer thread. Returns 1 on
 // successful enqueue, 0 if the writer inbox is full.
 int ndb_request_delete_note(struct ndb *ndb, const unsigned char *id);
+
+// grain fork: commit notification. ndb_process_event only queues an event;
+// these let a caller learn when another writer batch has finished, so it can
+// check whether its note is visible yet. ndb_wait_for_commit blocks until the
+// epoch passes `after` and returns the new one, or 0 once
+// ndb_wake_commit_waiters has been called. Wake, and wait for every waiter to
+// return, before ndb_destroy.
+uint64_t ndb_commit_epoch(struct ndb *ndb);
+uint64_t ndb_wait_for_commit(struct ndb *ndb, uint64_t after);
+void ndb_wake_commit_waiters(struct ndb *ndb);
 
 void ndb_ingest_meta_init(struct ndb_ingest_meta *meta, unsigned client, const char *relay);
 // Process an event, recording the relay where it came from.

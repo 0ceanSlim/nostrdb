@@ -326,6 +326,14 @@ struct ndb_writer {
 	pthread_t thread_id;
 
 	struct prot_queue inbox;
+
+	// grain fork: commit notification. commit_epoch goes up after every
+	// batch that opened a write txn, whether or not it committed, so a
+	// caller waiting on a write can look again; see ndb_wait_for_commit
+	pthread_mutex_t commit_lock;
+	pthread_cond_t commit_cond;
+	uint64_t commit_epoch;
+	int commit_closed;
 };
 
 struct ndb_ingester {
@@ -3756,7 +3764,8 @@ static int ndb_ingester_process_note(secp256k1_context *secp,
 		prot_queue_push_blocking(ingester->writer_inbox, &msg);
 
 		return 1;
-	} else if (note->kind == 6) {
+	} else if (note->kind == 6 &&
+		   !(ingester->flags & NDB_FLAG_NO_REPOST_INGEST)) {
 		// process the repost if we have a repost event
 		//ndb_debug("processing kind 6 repost\n");
 		// dup the relay string
@@ -7373,10 +7382,13 @@ static uint64_t ndb_write_note(secp256k1_context *secp,
 			ndb_write_new_blocks(txn, note->note, note_key, scratch, scratch_size);
 		}
 
-		ndb_process_note_stats(txn, note->note, scratch, scratch_size);
+		// grain fork: NO_STATS covers reply counts too
+		if (!ndb_flag_set(ndb_flags, NDB_FLAG_NO_STATS))
+			ndb_process_note_stats(txn, note->note, scratch, scratch_size);
 	} else if (kind == 7 && !ndb_flag_set(ndb_flags, NDB_FLAG_NO_STATS)) {
 		ndb_write_reaction_stats(txn, note->note, scratch, scratch_size);
-	} else if (kind == 6 || kind == 16) {
+	} else if ((kind == 6 || kind == 16) &&
+		   !ndb_flag_set(ndb_flags, NDB_FLAG_NO_STATS)) {
 		ndb_process_repost_stats(txn, note->note, scratch, scratch_size);
 	} else if (kind == 9735 && !ndb_flag_set(ndb_flags, NDB_FLAG_NO_STATS)) {
 		ndb_write_unverified_zap_stats(txn, note->note, scratch, scratch_size);
@@ -8529,6 +8541,15 @@ static void ndb_writer_free_msgs(struct ndb_writer_msg *msgs, int popped)
 	}
 }
 
+// grain fork: tell commit waiters a batch has finished
+static void ndb_writer_bump_commit(struct ndb_writer *writer)
+{
+	pthread_mutex_lock(&writer->commit_lock);
+	writer->commit_epoch++;
+	pthread_cond_broadcast(&writer->commit_cond);
+	pthread_mutex_unlock(&writer->commit_lock);
+}
+
 static void *ndb_writer_thread(void *data)
 {
 	ndb_debug("started writer thread\n");
@@ -8591,6 +8612,7 @@ static void *ndb_writer_thread(void *data)
 					ndb_write_failed();
 			}
 			ndb_writer_free_msgs(msgs, popped);
+			ndb_writer_bump_commit(writer);
 			continue;
 		}
 
@@ -8699,6 +8721,7 @@ static void *ndb_writer_thread(void *data)
 							 num_notes);
 				// update subscriptions
 			}
+			ndb_writer_bump_commit(writer);
 		}
 
 		ndb_writer_free_msgs(msgs, popped);
@@ -9171,6 +9194,11 @@ static int ndb_writer_init(struct ndb_writer *writer, struct ndb_lmdb *lmdb,
 	prot_queue_init(&writer->inbox, writer->queue_buf,
 			writer->queue_buflen, sizeof(struct ndb_writer_msg));
 
+	pthread_mutex_init(&writer->commit_lock, NULL);
+	pthread_cond_init(&writer->commit_cond, NULL);
+	writer->commit_epoch = 0;
+	writer->commit_closed = 0;
+
 	// spin up the writer thread
 	if (THREAD_CREATE(writer->thread_id, ndb_writer_thread, writer))
 	{
@@ -9233,9 +9261,55 @@ static int ndb_writer_destroy(struct ndb_writer *writer)
 	ndb_debug("writer: cleaning up protected queue\n");
 	prot_queue_destroy(&writer->inbox);
 
+	pthread_mutex_destroy(&writer->commit_lock);
+	pthread_cond_destroy(&writer->commit_cond);
+
 	free(writer->queue_buf);
 
 	return 1;
+}
+
+// grain fork: commit notification
+//
+// A relay must not acknowledge a write before it is durable, but
+// ndb_process_event only queues the event. These let a caller learn when
+// the writer has finished another batch, and then look the note up: once
+// it is visible to a read txn it has committed.
+
+uint64_t ndb_commit_epoch(struct ndb *ndb)
+{
+	uint64_t epoch;
+
+	pthread_mutex_lock(&ndb->writer.commit_lock);
+	epoch = ndb->writer.commit_epoch;
+	pthread_mutex_unlock(&ndb->writer.commit_lock);
+	return epoch;
+}
+
+// Block until a writer batch finishes after epoch `after`, and return the
+// new epoch. Returns 0 once ndb_wake_commit_waiters has been called, which
+// must happen, and every waiter must have returned, before ndb_destroy.
+uint64_t ndb_wait_for_commit(struct ndb *ndb, uint64_t after)
+{
+	struct ndb_writer *writer = &ndb->writer;
+	uint64_t epoch;
+
+	pthread_mutex_lock(&writer->commit_lock);
+	while (writer->commit_epoch <= after && !writer->commit_closed)
+		pthread_cond_wait(&writer->commit_cond, &writer->commit_lock);
+	epoch = writer->commit_closed ? 0 : writer->commit_epoch;
+	pthread_mutex_unlock(&writer->commit_lock);
+	return epoch;
+}
+
+void ndb_wake_commit_waiters(struct ndb *ndb)
+{
+	struct ndb_writer *writer = &ndb->writer;
+
+	pthread_mutex_lock(&writer->commit_lock);
+	writer->commit_closed = 1;
+	pthread_cond_broadcast(&writer->commit_cond);
+	pthread_mutex_unlock(&writer->commit_lock);
 }
 
 static int ndb_ingester_destroy(struct ndb_ingester *ingester)
