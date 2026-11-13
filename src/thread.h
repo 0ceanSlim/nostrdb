@@ -57,7 +57,28 @@ typedef CONDITION_VARIABLE pthread_cond_t;
   #include <pthread.h>
 
   //#define     ErrCode()       errno
-  #define THREAD_CREATE(thr,start,arg)	pthread_create(&thr,NULL,start,arg)
+
+  // grain fork: ask for an explicit stack. musl gives new threads 128 KiB,
+  // and the writer thread's batch arrays alone take ~290 KiB of its frame,
+  // so on Alpine it overflowed into whatever sat below it. 8 MiB is what
+  // glibc hands out by default, so every libc now behaves the same.
+  #define NDB_THREAD_STACK_SIZE (8 * 1024 * 1024)
+
+  static inline int ndb_thread_create(pthread_t *thr,
+				      void *(*start)(void *), void *arg)
+  {
+	pthread_attr_t attr;
+	int rc;
+
+	if ((rc = pthread_attr_init(&attr)))
+		return rc;
+	if ((rc = pthread_attr_setstacksize(&attr, NDB_THREAD_STACK_SIZE)) == 0)
+		rc = pthread_create(thr, &attr, start, arg);
+	pthread_attr_destroy(&attr);
+	return rc;
+  }
+
+  #define THREAD_CREATE(thr,start,arg)	ndb_thread_create(&(thr),start,arg)
   #define THREAD_FINISH(thr)	pthread_join(thr,NULL)
   #define THREAD_TERMINATE(thr)	pthread_exit(&thr)
   
