@@ -4949,6 +4949,20 @@ static int ndb_query_plan_scan_id_prefix(struct ndb_txn *txn, MDB_cursor *cur,
 	return 1;
 }
 
+/* The seek key for a filter's until. Index seeks land on the newest entry
+ * strictly before their key, so seek from just past until to keep notes at
+ * created_at == until; the filter match drops anything newer. */
+static uint64_t ndb_filter_until_seek(struct ndb_filter *filter)
+{
+	uint64_t *pint;
+
+	if (!(pint = ndb_filter_get_int(filter, NDB_FILTER_UNTIL)) ||
+	    *pint == UINT64_MAX)
+		return UINT64_MAX;
+
+	return *pint + 1;
+}
+
 static int ndb_query_plan_execute_ids(struct ndb_txn *txn,
 				      struct ndb_filter *filter,
 				      struct ndb_query_state *results)
@@ -4968,13 +4982,10 @@ static int ndb_query_plan_execute_ids(struct ndb_txn *txn,
 	struct ndb_note_relay_iterator note_relay_iter = {0};
 	struct ndb_note_relay_iterator *relay_iter = NULL;
 
-	until = UINT64_MAX;
-
 	if (!(ids = ndb_filter_find_elements(filter, NDB_FILTER_IDS)))
 		return 0;
 
-	if ((pint = ndb_filter_get_int(filter, NDB_FILTER_UNTIL)))
-		until = *pint;
+	until = ndb_filter_until_seek(filter);
 
 	if (ndb_filter_find_elements(filter, NDB_FILTER_RELAYS))
 		need_relays = 1;
@@ -5100,9 +5111,7 @@ static int ndb_query_plan_execute_authors(struct ndb_txn *txn,
 	if (!(authors = ndb_filter_find_elements(filter, NDB_FILTER_AUTHORS)))
 		return 0;
 
-	until = UINT64_MAX;
-	if ((pint = ndb_filter_get_int(filter, NDB_FILTER_UNTIL)))
-		until = *pint;
+	until = ndb_filter_until_seek(filter);
 
 	since = 0;
 	if ((pint = ndb_filter_get_int(filter, NDB_FILTER_SINCE)))
@@ -5556,9 +5565,7 @@ static int ndb_query_plan_execute_created_at(struct ndb_txn *txn,
 	uint64_t *kinds, *pint, until, since;
 	int i, num_kinds, need_relays = 0, ok;
 
-	until = UINT64_MAX;
-	if ((pint = ndb_filter_get_int(filter, NDB_FILTER_UNTIL)))
-		until = *pint;
+	until = ndb_filter_until_seek(filter);
 
 	since = 0;
 	if ((pint = ndb_filter_get_int(filter, NDB_FILTER_SINCE)))
@@ -5620,9 +5627,7 @@ static int ndb_query_plan_execute_tags(struct ndb_txn *txn,
 	if (ndb_filter_find_elements(filter, NDB_FILTER_RELAYS))
 		need_relays = 1;
 
-	until = UINT64_MAX;
-	if ((pint = ndb_filter_get_int(filter, NDB_FILTER_UNTIL)))
-		until = *pint;
+	until = ndb_filter_until_seek(filter);
 
 	if ((rc = mdb_cursor_open(txn->mdb_txn, db, &cur)))
 		return 0;
@@ -5710,9 +5715,7 @@ static int ndb_query_plan_execute_author_kinds(
 
 	relays = ndb_filter_find_elements(filter, NDB_FILTER_RELAYS);
 
-	until = UINT64_MAX;
-	if ((pint = ndb_filter_get_int(filter, NDB_FILTER_UNTIL)))
-		until = *pint;
+	until = ndb_filter_until_seek(filter);
 
 	since = 0;
 	if ((pint = ndb_filter_get_int(filter, NDB_FILTER_SINCE)))
@@ -5914,9 +5917,7 @@ static int ndb_query_plan_execute_kinds(struct ndb_txn *txn,
 	if (ndb_filter_find_elements(filter, NDB_FILTER_RELAYS))
 		need_relays = 1;
 
-	until = UINT64_MAX;
-	if ((pint = ndb_filter_get_int(filter, NDB_FILTER_UNTIL)))
-		until = *pint;
+	until = ndb_filter_until_seek(filter);
 
 	since = 0;
 	if ((pint = ndb_filter_get_int(filter, NDB_FILTER_SINCE)))
